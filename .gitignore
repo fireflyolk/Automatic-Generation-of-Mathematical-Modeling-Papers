@@ -1,0 +1,16 @@
+.superpowers/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+*.egg-info/
+app/state/
+app/logs/
+app/cache/
+/projects/
