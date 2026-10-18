@@ -4,7 +4,9 @@ import subprocess
 import unittest
 import uuid
 
-from mathmodel_paper_studio.bootstrap.paths import AppPaths, PathPolicyError, APPROVED_BASE
+from mathmodel_paper_studio.bootstrap.paths import (
+    AppPaths, PathPolicyError, APPROVED_BASE, validate_import_source_path, validate_managed_path,
+)
 
 
 class PathsTests(unittest.TestCase):
@@ -31,6 +33,20 @@ class PathsTests(unittest.TestCase):
         for path in invalid:
             with self.subTest(path=path), self.assertRaises(PathPolicyError):
                 AppPaths(path)
+
+    def test_import_sources_allow_any_local_drive_without_widening_managed_storage(self):
+        for raw in (r'C:\__mathmodel_path_probe__\data.docx',
+                    r'F:\documents\contest\data.docx'):
+            with self.subTest(path=raw):
+                self.assertEqual(Path(raw), validate_import_source_path(raw))
+        for path in (r'\\server\share\data.docx', 'C:documents/data.docx',
+                     'relative/data.docx', r'C:\documents\..\secret.docx'):
+            with self.subTest(path=path), self.assertRaises(PathPolicyError):
+                validate_import_source_path(path)
+        with self.assertRaises(PathPolicyError):
+            validate_managed_path(Path(r'C:\__mathmodel_path_probe__\data.docx'))
+        with self.assertRaises(PathPolicyError):
+            validate_managed_path(Path(r'F:\documents\contest\data.docx'))
 
     def test_environment_configured_before_optional_imports_without_auth_relocation(self):
         paths = AppPaths(self.root)

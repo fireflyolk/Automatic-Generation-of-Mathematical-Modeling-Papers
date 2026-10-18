@@ -1,4 +1,4 @@
-"""Provider choice and F:-only storage settings; never reads credentials."""
+"""Provider choice and F:-only storage settings; never displays or stores credentials."""
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFormLayout, QFrame, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, CaptionLabel, CardWidget, ComboBox, TitleLabel
@@ -6,11 +6,37 @@ from qfluentwidgets import BodyLabel, CaptionLabel, CardWidget, ComboBox, TitleL
 from mathmodel_paper_studio.agents.preflight import (
     AdapterCapabilities, Provider, ProviderStatus, UnavailableReason,
 )
+from mathmodel_paper_studio.agents.codex_model_preferences import (
+    CodexModelPreference,
+    CodexModelPreferenceError,
+    CodexModelPreferenceStore,
+)
+from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    DEFAULT_DEEPSEEK_EFFORT,
+    DEFAULT_DEEPSEEK_MODEL,
+    DeepSeekModelPreference,
+    DeepSeekModelPreferenceError,
+    DeepSeekModelPreferenceStore,
+)
 from mathmodel_paper_studio.agents.providers.deepseek_api import DeepSeekApiClient
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 
 _VISIBLE_PROVIDERS = (Provider.CODEX, Provider.DEEPSEEK)
 _LABELS = {Provider.CODEX: 'Codex', Provider.DEEPSEEK: 'DeepSeek API'}
+_CODEX_PROFILE = 'text_only_no_environment'
+
+
+def _codex_policy_ready(status):
+    if not isinstance(status, ProviderStatus) or status.provider is not Provider.CODEX:
+        return False
+    caps = status.capabilities
+    return bool(
+        status.available and status.evidence_verified and status.version == '0.159.3'
+        and caps.streaming and caps.cancellation and caps.filesystem_confinement
+        and caps.network_behavior == 'provider_transport_only'
+        and caps.credential_inheritance == 'cli_native_only'
+        and caps.tool_profile == _CODEX_PROFILE
+    )
 
 
 def _unverified_status(provider):
@@ -26,19 +52,39 @@ def _unverified_status(provider):
 class SettingsView(QWidget):
     provider_changed = Signal(object)
     codex_connection_test_requested = Signal()
+    codex_model_settings_requested = Signal()
+    deepseek_model_settings_requested = Signal()
 
-    def __init__(self, paths: AppPaths, provider_statuses=None, parent=None):
+    def __init__(self, paths: AppPaths, provider_statuses=None, parent=None,
+                 codex_model_preferences=None, deepseek_model_preferences=None):
         super().__init__(parent)
         if not isinstance(paths, AppPaths):
             raise TypeError('设置页需要 AppPaths。')
         self.paths = paths
+        self.codex_model_preferences = codex_model_preferences or CodexModelPreferenceStore(paths)
+        try:
+            self._codex_model_preference = self.codex_model_preferences.load()
+            self._codex_model_preference_error = False
+        except CodexModelPreferenceError:
+            self._codex_model_preference = None
+            self._codex_model_preference_error = True
+        self.deepseek_model_preferences = (
+            deepseek_model_preferences or DeepSeekModelPreferenceStore(paths)
+        )
+        try:
+            self._deepseek_model_preference = self.deepseek_model_preferences.load()
+            self._deepseek_model_preference_error = False
+        except DeepSeekModelPreferenceError:
+            self._deepseek_model_preference = None
+            self._deepseek_model_preference_error = True
         self._codex_connection_text = '本机 CLI 检查尚未执行；模型请求未发起。'
         self._codex_probe_pending = False
         self._statuses = {provider: _unverified_status(provider) for provider in _VISIBLE_PROVIDERS}
         if provider_statuses is not None:
             for status in provider_statuses:
                 if isinstance(status, ProviderStatus) and status.provider in _VISIBLE_PROVIDERS:
-                    self._statuses[status.provider] = status
+                    if status.provider is not Provider.CODEX or not status.available or _codex_policy_ready(status):
+                        self._statuses[status.provider] = status
         self.setObjectName('settingsPage')
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -89,10 +135,28 @@ class SettingsView(QWidget):
             '发送一条固定 canary 提示验证本机 Codex 连接；不会发送题目或文件，可能使用账户额度。'
         )
         self.codex_test_button.clicked.connect(self.codex_connection_test_requested.emit)
+        self.codex_model_button = QPushButton('Codex 模型与推理强度…', provider_card)
+        self.codex_model_button.setObjectName('openCodexModelSettingsButton')
+        self.codex_model_button.clicked.connect(self.codex_model_settings_requested.emit)
+        self.codex_model_summary = CaptionLabel(provider_card)
+        self.codex_model_summary.setObjectName('codexModelSelectionSummary')
+        self.codex_model_summary.setWordWrap(True)
+        self.deepseek_model_button = QPushButton('DeepSeek 模型与推理强度…', provider_card)
+        self.deepseek_model_button.setObjectName('openDeepSeekModelSettingsButton')
+        self.deepseek_model_button.clicked.connect(self.deepseek_model_settings_requested.emit)
+        self.deepseek_model_summary = CaptionLabel(provider_card)
+        self.deepseek_model_summary.setObjectName('deepseekModelSelectionSummary')
+        self.deepseek_model_summary.setWordWrap(True)
         form.addRow('Agent', self.provider_combo)
         form.addRow('本机接入状态', self.connection_label)
         provider_layout.addLayout(form)
         provider_layout.addWidget(self.codex_test_button)
+        provider_layout.addWidget(self.codex_model_button)
+        provider_layout.addWidget(self.codex_model_summary)
+        provider_layout.addWidget(self.deepseek_model_button)
+        provider_layout.addWidget(self.deepseek_model_summary)
+        self._update_codex_model_summary()
+        self._update_deepseek_model_summary()
         content_layout.addWidget(provider_card)
 
         preflight_card = CardWidget(content)
@@ -106,7 +170,8 @@ class SettingsView(QWidget):
         preflight_layout.addWidget(self.status_label)
         self.disclosure_label = BodyLabel(
             'Codex 使用本机 CLI 登录。DeepSeek 使用 API；本应用不保存 API 密钥，'
-            '密钥只从 DEEPSEEK_API_KEY 环境变量读取，不显示也不写入项目数据。'
+            '密钥从 DEEPSEEK_API_KEY 环境变量读取；若当前进程未继承，会只读检查 Windows 用户环境变量。'
+            '密钥不显示也不写入项目数据。'
             'API 请求会发送审核页列出的题目、所选数据摘要和阶段结果，并按 token 用量计费。'
             '当前生成代码执行安全门未通过验收，运行会在计算阶段暂停，不会生成最终 Word。',
             preflight_card,
@@ -131,6 +196,51 @@ class SettingsView(QWidget):
     def selected_status(self) -> ProviderStatus:
         return self._statuses[self.selected_provider]
 
+    def set_codex_model_preference(self, preference):
+        if preference is not None and not isinstance(preference, CodexModelPreference):
+            raise TypeError('Codex 模型设置类型无效。')
+        self._codex_model_preference = preference
+        self._codex_model_preference_error = False
+        self._update_codex_model_summary()
+
+    def set_deepseek_model_preference(self, preference):
+        if preference is not None and not isinstance(preference, DeepSeekModelPreference):
+            raise TypeError('DeepSeek 模型设置类型无效。')
+        self._deepseek_model_preference = preference
+        self._deepseek_model_preference_error = False
+        self._update_deepseek_model_summary()
+
+    def _update_codex_model_summary(self):
+        if not hasattr(self, 'codex_model_summary'):
+            return
+        if self._codex_model_preference_error:
+            summary = 'Codex 模型设置文件无效；正式运行会停止发送请求。'
+        elif self._codex_model_preference is None:
+            summary = '当前沿用 Codex CLI 默认模型与推理强度。'
+        else:
+            summary = (
+                f'当前选择：{self._codex_model_preference.model} · '
+                f'{self._codex_model_preference.effort}'
+            )
+        self.codex_model_summary.setText(summary)
+
+    def _update_deepseek_model_summary(self):
+        if not hasattr(self, 'deepseek_model_summary'):
+            return
+        if self._deepseek_model_preference_error:
+            summary = 'DeepSeek 模型设置文件无效；正式运行会停止发送请求。'
+        elif self._deepseek_model_preference is None:
+            summary = (
+                f'当前使用 DeepSeek 默认：{DEFAULT_DEEPSEEK_MODEL} · '
+                f'{DEFAULT_DEEPSEEK_EFFORT}'
+            )
+        else:
+            summary = (
+                f'当前选择：{self._deepseek_model_preference.model} · '
+                f'{self._deepseek_model_preference.effort}'
+            )
+        self.deepseek_model_summary.setText(summary)
+
     def set_codex_probe_pending(self):
         self._codex_probe_pending = True
         self.codex_test_button.setEnabled(False)
@@ -142,24 +252,32 @@ class SettingsView(QWidget):
 
     def set_codex_probe_status(self, status: ProviderStatus):
         if (not isinstance(status, ProviderStatus) or status.provider is not Provider.CODEX
-                or status.available is not False or status.evidence_verified is not False):
+                or status.available and not _codex_policy_ready(status)):
             raise TypeError('Codex 连接检查状态无效。')
         self._codex_probe_pending = False
         self.codex_test_button.setEnabled(self.selected_provider is Provider.CODEX)
         self._statuses[Provider.CODEX] = status
-        if status.connection_verified:
+        if _codex_policy_ready(status) and status.connection_verified:
             self._codex_connection_text = (
-                f'Codex CLI {status.version} 已收到固定文本连接验证回复；未发送题目或文件。'
-                '这只证明文本连通，项目范围与执行隔离尚未通过，自动运行保持关闭。'
+                f'Codex CLI {status.version} 本机无执行环境策略已通过，固定 canary 也已收到回复；'
+                '没有发送题目或文件。正式运行仍需再次检查本次所选文件范围。'
             )
-        elif (status.reason is UnavailableReason.CAPABILITIES_UNVERIFIED and status.executable
-              and status.version and '尚未发送固定文本连接请求' in status.message):
+        elif _codex_policy_ready(status):
+            self._codex_connection_text = (
+                f'Codex CLI {status.version} 本机无执行环境策略已验证；尚未发送固定 canary。'
+            )
+        elif status.connection_verified:
+            self._codex_connection_text = (
+                '固定 canary 未能通过完整的本机运行策略验证；题目和文件未发送，自动运行保持关闭。'
+            )
+        elif ('尚未发送固定文本连接请求' in status.message
+              and status.executable and status.version):
             self._codex_connection_text = (
                 f'Codex CLI {status.version} 安装和本地登录状态已检查；尚未发送固定文本请求。'
             )
         elif status.reason is UnavailableReason.CAPABILITIES_UNVERIFIED and status.executable and status.version:
             self._codex_connection_text = (
-                f'Codex CLI {status.version} 固定文本连通请求未通过；运行边界尚未验证，自动运行保持关闭。'
+                f'Codex CLI {status.version} 本机策略预检未通过；固定 canary 未发送，自动运行保持关闭。'
             )
         elif status.reason is UnavailableReason.LOGIN_REQUIRED:
             self._codex_connection_text = (
@@ -177,7 +295,7 @@ class SettingsView(QWidget):
             )
         else:
             self._codex_connection_text = (
-                '本机 Codex CLI 检查未完成；模型请求未发起，自动运行仍关闭。'
+                '本机策略或固定 canary 验证未通过；题目和文件未发送，自动运行保持关闭。'
             )
         if self.selected_provider is Provider.CODEX:
             self._selection_changed()

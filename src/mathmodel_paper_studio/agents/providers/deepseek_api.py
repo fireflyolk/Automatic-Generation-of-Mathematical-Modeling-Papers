@@ -10,19 +10,29 @@ import os
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 
 from mathmodel_paper_studio.agents.preflight import (
     AdapterCapabilities, Provider, ProviderStatus, UnavailableReason,
 )
+from mathmodel_paper_studio.agents.deepseek_model_catalog import parse_model_catalog
+from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    DEFAULT_DEEPSEEK_EFFORT,
+    DEFAULT_DEEPSEEK_MODEL,
+    DeepSeekModelPreference,
+)
+from mathmodel_paper_studio.agents.protocol import AgentEvent, EventKind
+from mathmodel_paper_studio.agents.process_runner import _Redactor
 from mathmodel_paper_studio.domain.models import identifier
 
 
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
-MODEL = 'deepseek-flash'
+MODEL = DEFAULT_DEEPSEEK_MODEL
 _HOST = 'api.deepseek.com'
 _PATH = '/chat/completions'
+_MODELS_PATH = '/models'
 _PORT = 443
 _REQUEST_TIMEOUT_SECONDS = 45.0
 _MAX_PROMPT_BYTES = 900 * 1024
@@ -51,6 +61,26 @@ _CAPABILITIES = AdapterCapabilities(
     credential_inheritance='process_memory_only',
     tool_profile='api_no_tools',
 )
+
+
+def _environment_key():
+    """Read the configured key without mutating environment or registry state."""
+    process_key = os.environ.get('DEEPSEEK_API_KEY')
+    if process_key is not None:
+        return process_key
+    if sys.platform != 'win32':
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0,
+                            winreg.KEY_QUERY_VALUE) as environment:
+            user_key, value_type = winreg.QueryValueEx(environment, 'DEEPSEEK_API_KEY')
+        if value_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) and isinstance(user_key, str):
+            return user_key
+    except (ImportError, OSError):
+        return None
+    return None
 
 
 class _SafeClientError(ValueError):
@@ -280,6 +310,19 @@ def _validate_prompt(prompt):
     return encoded
 
 
+def _emit_text_chunks(emit, text):
+    remaining = text
+    while remaining:
+        encoded = remaining.encode('utf-8')
+        if len(encoded) <= 64 * 1024:
+            chunk, remaining = remaining, ''
+        else:
+            chunk = encoded[:64 * 1024].decode('utf-8', errors='ignore')
+            remaining = encoded[len(chunk.encode('utf-8')):].decode('utf-8')
+        if chunk:
+            emit(EventKind.TEXT, chunk)
+
+
 def _context_names(context, attribute, maximum):
     values = getattr(context, attribute, ())
     if not isinstance(values, (tuple, list)) or len(values) > maximum:
@@ -304,15 +347,19 @@ class DeepSeekApiClient:
     never restore it.
     """
 
-    def __init__(self, *, key_resolver=None, transport_factory=None):
+    def __init__(self, *, key_resolver=None, transport_factory=None, preference_resolver=None):
         if key_resolver is not None and not callable(key_resolver):
             raise TypeError('API Key 读取器必须可调用。')
         if transport_factory is not None and not callable(transport_factory):
             raise TypeError('HTTPS 传输工厂必须可调用。')
-        self._key_resolver = key_resolver or (lambda: os.environ.get('DEEPSEEK_API_KEY'))
+        if preference_resolver is not None and not callable(preference_resolver):
+            raise TypeError('DeepSeek 模型设置读取器必须可调用。')
+        self._key_resolver = key_resolver if key_resolver is not None else _environment_key
         self._transport_factory = transport_factory
+        self._preference_resolver = preference_resolver if preference_resolver is not None else lambda: None
         self._lock = threading.RLock()
         self._authorized_run_id = None
+        self._authorized_preference = None
         self._active_run_id = None
         self._active_abort_event = None
         self._active_connection = None
@@ -337,13 +384,18 @@ class DeepSeekApiClient:
             False,
         )
 
-    def authorize_chargeable_requests(self, run_id):
+    def authorize_chargeable_requests(self, run_id, *, preference=None):
         """Authorize billable requests for exactly one run on this instance."""
         run_id = identifier(run_id)
+        if preference is None:
+            preference = self._resolved_preference()
+        elif not isinstance(preference, DeepSeekModelPreference):
+            raise _SafeRuntimeError('DeepSeek 模型设置无效；请求已停止。')
         with self._lock:
             if self._authorized_run_id is not None or self._active_run_id is not None:
                 raise RuntimeError('已有 DeepSeek 运行授权，请先完成并撤销。')
             self._authorized_run_id = run_id
+            self._authorized_preference = preference
 
     def revoke_chargeable_requests(self, run_id):
         """Revoke the matching run consent and interrupt an active request."""
@@ -354,12 +406,22 @@ class DeepSeekApiClient:
             if self._authorized_run_id != run_id:
                 raise ValueError('DeepSeek 授权运行标识不匹配。')
             self._authorized_run_id = None
+            self._authorized_preference = None
             connection = self._active_connection if self._active_run_id == run_id else None
             abort_event = self._active_abort_event if self._active_run_id == run_id else None
         if abort_event is not None:
             abort_event.set()
         if connection is not None:
             self._close_connection(connection)
+
+    def authorized_model_preference(self, run_id):
+        """Return the model choice bound to this run's current consent, if any."""
+        run_id = identifier(run_id)
+        with self._lock:
+            if self._authorized_run_id != run_id:
+                return None
+            preference = self._authorized_preference
+            return preference if isinstance(preference, DeepSeekModelPreference) else None
 
     def prepare_scope(self, context, prompt):
         """Return a display-safe summary of data sent to DeepSeek; no request."""
@@ -373,12 +435,140 @@ class DeepSeekApiClient:
             '已验证的上游阶段摘要',
             '应用规则与导入内容信任说明',
         )
+        preference = self._resolved_preference()
+        notice = (
+            f'{_EXTERNAL_NOTICE}本次模型：{preference.model}，推理强度：{preference.effort}。'
+        )
         return ExternalProcessingScope(
-            'DeepSeek', ENDPOINT, MODEL, stage, selected, upstream,
-            categories, prompt_bytes, True, False, _EXTERNAL_NOTICE,
+            'DeepSeek', ENDPOINT, preference.model, stage, selected, upstream,
+            categories, prompt_bytes, True, False, notice,
         )
 
+    def list_models(self, cancel_event=None):
+        """Read a bounded model catalog using only the API key, without project data."""
+        if cancel_event is not None and not callable(getattr(cancel_event, 'is_set', None)):
+            raise ValueError('DeepSeek 模型目录取消信号无效。')
+        if cancel_event is not None and cancel_event.is_set():
+            raise _SafeRuntimeError('DeepSeek 模型目录请求已取消。')
+        key = self._resolve_key()
+        if key is None:
+            raise _SafeClientError('未检测到有效的 DEEPSEEK_API_KEY 环境变量。')
+        abort_event = _AbortSignal(cancel_event)
+        deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+        connection = None
+        response = None
+        monitor_stop = threading.Event()
+        timed_out = threading.Event()
+        monitor = None
+        try:
+            tls_context = ssl.create_default_context()
+            if tls_context.verify_mode != ssl.CERT_REQUIRED or not tls_context.check_hostname:
+                raise _SafeClientError('DeepSeek TLS 证书验证未启用。')
+            connection = self._new_connection(
+                tls_context, abort_event, deadline, None, authorization_check=lambda: True,
+            )
+            monitor = threading.Thread(
+                target=self._watch_cancel,
+                args=(connection, abort_event, monitor_stop, timed_out, deadline),
+                daemon=True,
+            )
+            monitor.start()
+            headers = {
+                'Authorization': 'Bearer ' + key,
+                'Accept': 'application/json',
+            }
+            connection.request('GET', _MODELS_PATH, body=None, headers=headers)
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SafeRuntimeError('DeepSeek 模型目录请求已取消。')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _SafeClientError('DeepSeek 模型目录请求超时。')
+            self._set_socket_timeout(connection, remaining)
+            response = connection.getresponse()
+            status = getattr(response, 'status', None)
+            if type(status) is not int or status != 200:
+                raise _SafeClientError('DeepSeek 模型目录读取失败。')
+            raw = response.read(512 * 1024 + 1)
+            if not isinstance(raw, bytes) or len(raw) > 512 * 1024 or key.encode('ascii') in raw:
+                raise _SafeClientError('DeepSeek 模型目录无效或超过安全上限。')
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SafeRuntimeError('DeepSeek 模型目录请求已取消。')
+            models = parse_model_catalog(raw)
+            if timed_out.is_set():
+                raise _SafeClientError('DeepSeek 模型目录请求超时。')
+            return models
+        except (_SafeClientError, _SafeRuntimeError):
+            raise
+        except Exception:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SafeRuntimeError('DeepSeek 模型目录请求已取消。') from None
+            if timed_out.is_set() or time.monotonic() >= deadline:
+                raise _SafeClientError('DeepSeek 模型目录请求超时。') from None
+            raise _SafeClientError('DeepSeek 模型目录读取失败。') from None
+        finally:
+            monitor_stop.set()
+            if monitor is not None:
+                monitor.join(timeout=0.2)
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                self._close_connection(connection)
+
+    def _resolved_preference(self):
+        try:
+            preference = self._preference_resolver()
+        except Exception:
+            raise _SafeRuntimeError('DeepSeek 模型设置无效；请求已停止。') from None
+        if preference is None:
+            return DeepSeekModelPreference(MODEL, DEFAULT_DEEPSEEK_EFFORT)
+        if not isinstance(preference, DeepSeekModelPreference):
+            raise _SafeRuntimeError('DeepSeek 模型设置无效；请求已停止。')
+        return preference
+
     def generate(self, context, prompt, cancel_event=None):
+        return self._generate(context, prompt, cancel_event)
+
+    def generate_with_progress(self, context, prompt, cancel_event=None, *, event_callback):
+        run_id, _, _, _ = _validate_context(context)
+        if not callable(event_callback):
+            raise ValueError('DeepSeek 进度回调无效。')
+        prompt_text = _validate_prompt(prompt).decode('utf-8')
+        redactor = _Redactor(
+            prompt_text, (getattr(context, 'authorized_problem', '') or '',),
+        )
+
+        def emit(kind, text=''):
+            try:
+                event_callback(AgentEvent(run_id, kind, text=text))
+            except Exception:
+                return
+
+        def request_sent():
+            emit(EventKind.STARTED)
+
+        try:
+            content = self._generate(context, prompt, cancel_event, on_request_sent=request_sent)
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
+            if not self._is_authorized(run_id):
+                raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。')
+            visible = redactor.clean(content, 'deepseek-message', final=True)
+            _emit_text_chunks(emit, visible)
+            emit(EventKind.COMPLETED)
+            return content
+        except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                emit(EventKind.CANCELLED)
+            elif isinstance(exc, _SafeRuntimeError):
+                emit(EventKind.BLOCKED)
+            else:
+                emit(EventKind.FAILED)
+            raise
+
+    def _generate(self, context, prompt, cancel_event=None, *, on_request_sent=None):
         run_id, _, rules, trust_notice = _validate_context(context)
         prompt_bytes = _validate_prompt(prompt)
         if cancel_event is not None and not callable(getattr(cancel_event, 'is_set', None)):
@@ -391,6 +581,9 @@ class DeepSeekApiClient:
                 raise _SafeRuntimeError('本次 DeepSeek 运行尚未明确授权可计费请求。')
             if self._active_run_id is not None:
                 raise _SafeRuntimeError('已有 DeepSeek 请求正在运行。')
+            preference = self._authorized_preference
+            if not isinstance(preference, DeepSeekModelPreference):
+                raise _SafeRuntimeError('DeepSeek 模型设置无效；请求已停止。')
             self._active_run_id = run_id
             self._active_abort_event = abort_event
         connection = None
@@ -405,7 +598,9 @@ class DeepSeekApiClient:
                 raise _SafeClientError('未检测到有效的 DEEPSEEK_API_KEY 环境变量。')
             if key in prompt_bytes.decode('utf-8') or key in rules or key in trust_notice:
                 raise _SafeClientError('请求内容疑似包含本机 API 凭据，已阻止发送。')
-            body = self._request_body(prompt_bytes, rules, trust_notice)
+            body = self._request_body(
+                prompt_bytes, rules, trust_notice, preference.model, preference.effort,
+            )
             tls_context = ssl.create_default_context()
             if tls_context.verify_mode != ssl.CERT_REQUIRED or not tls_context.check_hostname:
                 raise _SafeClientError('DeepSeek TLS 证书验证未启用。')
@@ -427,6 +622,11 @@ class DeepSeekApiClient:
                 'Content-Length': str(len(body)),
             }
             connection.request('POST', _PATH, body=body, headers=headers)
+            if callable(on_request_sent):
+                try:
+                    on_request_sent()
+                except Exception:
+                    pass
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消。')
             if not self._is_authorized(run_id):
@@ -485,18 +685,20 @@ class DeepSeekApiClient:
                     self._active_connection = None
 
     @staticmethod
-    def _request_body(prompt_bytes, rules, trust_notice):
+    def _request_body(prompt_bytes, rules, trust_notice, model=MODEL,
+                      effort=DEFAULT_DEEPSEEK_EFFORT):
         try:
             user_content = prompt_bytes.decode('utf-8', errors='strict')
             system_content = _SYSTEM_RULES + rules + '\n' + trust_notice
             payload = {
-                'model': MODEL,
+                'model': model,
                 'messages': [
                     {'role': 'system', 'content': system_content},
                     {'role': 'user', 'content': user_content},
                 ],
                 'stream': False,
                 'max_tokens': _MAX_OUTPUT_TOKENS,
+                'reasoning_effort': effort,
             }
             body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
         except (UnicodeError, TypeError, ValueError):
@@ -516,9 +718,12 @@ class DeepSeekApiClient:
             return None
         return key
 
-    def _new_connection(self, tls_context, abort_event, deadline, run_id):
+    def _new_connection(self, tls_context, abort_event, deadline, run_id,
+                        authorization_check=None):
         if self._transport_factory is not None:
             return self._transport_factory(_HOST, _PORT, _REQUEST_TIMEOUT_SECONDS, tls_context)
+        if authorization_check is None:
+            authorization_check = lambda: self._is_authorized(run_id)
         return _CancellableHTTPSConnection(
             _HOST,
             _PORT,
@@ -526,7 +731,7 @@ class DeepSeekApiClient:
             context=tls_context,
             abort_event=abort_event,
             deadline=deadline,
-            is_authorized=lambda: self._is_authorized(run_id),
+            is_authorized=authorization_check,
             state_lock=self._lock,
         )
 
@@ -593,4 +798,3 @@ class DeepSeekApiClient:
             return content
         except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
             raise _invalid_response() from None
-

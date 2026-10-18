@@ -200,6 +200,39 @@ class ReleaseAuditContracts(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_build_preflight_requires_the_locked_computation_runtime(self):
+        script = ROOT / "scripts/build_windows.ps1"
+        runtime = Path(
+            r"F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261018"
+            r"\computation-runtime-final"
+        )
+        good = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+             "-CheckOnly", "-BuildRoot", str(self.root / "good-build"),
+             "-OutputRoot", str(self.root / "good-output"), "-TaskTemp", str(self.root / "good-tmp"),
+             "-ComputationRuntimeRoot", str(runtime)],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertEqual(0, good.returncode, good.stderr)
+
+        missing_runtime = self.root / "missing-runtime"
+        bad = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+             "-CheckOnly", "-BuildRoot", str(self.root / "bad-build"),
+             "-OutputRoot", str(self.root / "bad-output"), "-TaskTemp", str(self.root / "bad-tmp"),
+             "-ComputationRuntimeRoot", str(missing_runtime)],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertNotEqual(0, bad.returncode)
+        self.assertFalse((self.root / "bad-build").exists())
+        self.assertFalse((self.root / "bad-output").exists())
+
+    def test_source_launch_exports_computation_runtime_before_desktop_bootstrap(self):
+        script = (ROOT / "scripts/build_windows.ps1").read_text(encoding="utf-8-sig")
+        export_runtime = script.index("$env:MMPS_COMPUTATION_RUNTIME_ROOT = $ComputationRuntimeRoot")
+        launch_source = script.index("if ($LaunchSource)")
+        self.assertLess(export_runtime, launch_source)
+
     def test_inventory_hashes_files_and_rejects_paths_outside_approved_f_root(self):
         audit = self.auditor()
         tree = self.root / "package"

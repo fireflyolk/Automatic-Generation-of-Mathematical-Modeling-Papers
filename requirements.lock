@@ -1,4 +1,4 @@
-# CPython 3.13.14 / Windows amd64, resolved and wheel-hashed through 2026-10-17.
+# CPython 3.13.14 / Windows amd64, resolved and wheel-hashed through 2026-10-18.
 # Includes runtime, test and packaging closure; Python 3.11 is not verified.
 # Install offline with --require-hashes and the recorded F: wheel directories.
 altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
@@ -16,6 +16,7 @@ pluggy==1.7.0 --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c4
 Pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
 pyinstaller==6.22.3 --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
 pyinstaller-hooks-contrib==2026.8 --hash=sha256:6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084
+pypdf==6.21.1 --hash=sha256:553e2d42f5bb3bb2a785a7d3de8ef90bb7df74b5413eff5a7b4388007ea9254b
 PySide6==6.8.2.1 --hash=sha256:92361e41727910e3560ea5ba494fabecc76cd20892c9fcb2ced07619081c4e65
 PySide6_Addons==6.8.2.1 --hash=sha256:c761cc45022aa79d8419e671e7fb34a4a3e5b3826f1e68fcb819bd6e3a387fbb
 PySide6_Essentials==6.8.2.1 --hash=sha256:18de224f09108998d194e60f2fb8a1e86367dd525dd8a6192598e80e6ada649e

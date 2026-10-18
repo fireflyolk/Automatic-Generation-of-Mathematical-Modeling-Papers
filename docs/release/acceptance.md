@@ -332,3 +332,45 @@
 
 - 完整 pytest 日志：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-ui-status-20261017\pytest-full-after-final-cleanup.log`
 - 最终模板候选 `.doc`：`F:\Codex另一个工作的地方\downloads\mathmodel-github-template-20261017\2025-huawei-cup-paper-template.doc`
+
+## 2026-10-18 题目 DOCX 导入和运行确认说明
+
+- 新建项目的“题目内容”区域新增“从 DOCX 导入题目”。选择本地 DOCX 后，应用受限提取正文段落和表格文本并填入题目框；图片不导入。DOCX 仅作为题目文本来源，不会被错误加入数据文件清单；创建项目时提取的文字写入 `00_inputs/problem-v0001.txt`，原始 DOCX 保持只读。输入选择支持 C:、D:、F: 等本地磁盘，项目和产物仍保存在 F:。
+- 运行审核页现在会显示“同意范围并开始”被禁用的具体原因。Codex 完整能力/隔离预检未通过时仍不能开始；当前默认 MainWindow 也没有配置 Codex 可信范围验证器。编辑文件范围或执行文本连通检查不会解锁按钮。本轮保留 fail-closed 行为，未伪造预检结果。
+- 定向验证：项目向导集成测试 **9 passed**；运行审核模型测试 **8 passed，4 subtests passed**；隔离 Qt 进程中的键盘导航和 1024×720 审核窗口布局 **2 passed**。最后加入纯文本安全呈现和消息长度上限后，DOCX 导入与禁用原因用例再次通过（**2 passed，2 subtests passed**）。全量 pytest 未在本轮重跑。
+- 最终冻结 EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-problem-docx-20261018\release-v2\MathModelPaperStudio\MathModelPaperStudio.exe`。SHA-256：`8E9C880C0D24D36A07907E6CBBA3B9E0F60B8FD5C14E57ECF151505E1E1D5C59`。依赖锁、包清单和归档成员审计均返回 `status=ok`；清单和归档报告位于同一 `release-v2` 目录。
+- 冻结启动检查 `status=ok`、`frozen=true`、Python 3.13.14；报告：`F:\Codex另一个工作的地方\tmp\mathmodel-problem-docx-20261018\frozen-exe-startup-v2.json`。冻结 GUI 显示标题“数模论文工作台”并正常关闭；数据根为 `F:\Codex另一个工作的地方\tmp\mathmodel-problem-docx-20261018\gui-data-v2`。
+- 桌面快捷方式现指向最终 EXE，原图标保持不变；最终切换前副本：`F:\Codex另一个工作的地方\tmp\mathmodel-problem-docx-20261018\DesktopShortcut-before-final-update.lnk`。原始旧快捷方式备份也保留在 `DesktopShortcut-before-update.lnk`。
+
+## 2026-10-18 题目文字版 PDF 导入验收
+
+- 新建项目现在可从同一入口导入 DOCX 或文字版 PDF。PDF 通过 `pypdf==6.21.1` 提取文本并填入可编辑题目框；不包含 OCR。加密、损坏、无可提取文字或超过资源限制的 PDF 会显示错误，并保留上一次成功导入的题目内容。
+- 成功导入的 PDF 原件会随项目保存到 `00_inputs`，清单记录原文件名、相对路径、SHA-256 和字节数。它不作为数据附件加入 `sources`，也不把 PDF 原始文件发送给 Agent；题目文字仍遵守运行审核页的范围确认。
+- PDF 解析边界：单文件最多 32 MiB、200 页、提取文字 100,000 字符；单个解压资源流最多 8 MiB，相关资源流合计最多 32 MiB。脚本、附件和动作不执行；图片流跳过。文字版 PDF 之外的扫描件需要用户先做 OCR。
+- 依赖固定在 `pypdf==6.21.1`；锁文件 wheel SHA-256 为 `553e2d42f5bb3bb2a785a7d3de8ef90bb7df74b5413eff5a7b4388007ea9254b`。
+
+### 验证结果
+
+- 最终定向组合：**52 passed，1 skipped，103 subtests passed，exit 0**；`pdf_reader.py` 覆盖率 96%，`import_service.py` 覆盖率 97%，合计 96.48%。跳过项是当前 Windows 账户缺少创建符号链接的权限。日志：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-pdf-20261018\pytest-final-clean-rerun.log`。
+- 项目向导 UI 集成测试 **11 passed，3 subtests passed**；PDF 解析器单元测试 **7 passed，9 subtests passed**。最终组合还覆盖项目原件保存、构建预检和审核页键盘/布局测试。
+- 本轮较早的全量 pytest 曾以 **2 failed，434 passed，1 skipped，42 warnings，672 subtests** 退出。构建预检失败是测试环境的仓库 `.venv` 缺少新锁定的 pypdf；安装后该预检通过。另一个失败是审核对话框键盘顺序测试没有把现有“更换 Agent”按钮计入；测试现已按实际焦点顺序修正，最终定向组合通过。**全量套件没有在修正后重跑**，所以本记录不把本次功能验收等同于全量回归全绿。
+- 最终 Windows 冻结包构建、依赖锁检查、包文件和归档成员审计均通过。交付 EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-pdf-20261018\release-v2\MathModelPaperStudio\MathModelPaperStudio.exe`；SHA-256：`26F08FB23CBBD5F7C35A4ADCE90BC8DFF44EA6502A6C466AAAE1B50699D9767`。打包代码与当前 PDF 导入、项目保存和向导源码比对一致：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-pdf-20261018\frozen-source-parity.json`。
+- 冻结版 GUI 实测：通过新建项目文件选择器导入两页中文 PDF，题目文字正确显示；再选择图片扫描 PDF 后，已导入题目保持不变；创建项目后原 PDF 的 SHA-256 与源文件一致。报告：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-pdf-20261018\frozen-pdf-ui-report.json`；截图：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-pdf-20261018\frozen-pdf-import.png`。
+- 桌面快捷方式本身未改写，仍保留原图标；它指向的 F 盘发布目录已替换为同一 PDF 版，启动检查 `status=ok`、`frozen=true`。原发布目录备份：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-pdf-20261018\desktop-release-before-pdf`；部署报告：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-pdf-20261018\desktop-deployment.json`。快捷方式文件 SHA-256 未变化。
+- 以上验收只覆盖 DOCX/PDF 题目导入、保存和冻结版界面；受控代码执行和最终用户 Word 模板页面验收仍按前文记录保持未通过，不代表完整论文自动生成工作流已验收。
+
+## 2026-10-18 题目与数据编辑验收
+
+- 项目详情新增“编辑题目与数据”：题目文本可编辑并使用撤销/重做；数据文件可添加、替换、移除，文件列表操作支持撤销/重做。
+- 保存以新输入版本提交；旧版本、运行记录和输出保留，版本清单最后提交。编辑期间拦截 Esc/关闭；同一项目的并发保存由进程锁和 Windows 命名互斥量串行化，过期版本会拒绝保存。
+- 保留原题 DOCX/PDF 原件元数据和哈希；保留现有 XLSX 工作表选择；清单允许 32 个数据文件、一个 Word 模板和题目文本共 34 条记录。题目 UTF-8 文本上限统一为 1 MiB，与主窗口读取限制一致。
+- 定向测试：项目路径/服务/安全 **38 passed，1 skipped，51 subtests passed**；项目编辑 UI **4 passed**；运行控制 UI **11 passed**。跳过项是当前 Windows 账户没有创建符号链接的权限；Qt 第三方弃用警告 18 条。此次没有重跑完整 pytest 套件。
+- 冻结包构建、依赖锁检查、包文件与归档成员审计通过。EXE SHA-256：`8BFD80CC13B05603B3307D19200593292D2F1F40074ED555597693D7B090B9D8`；冻结启动检查 `status=ok`、`frozen=true`。构建目录：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-project-edit-20261018\release-final`。
+- 已将最终包部署到 `F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-pdf-20261018\release-v2\MathModelPaperStudio`，部署后再次通过冻结启动检查。被替换的发布目录保存在 `F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-project-edit-20261018\desktop-release-before-final`。快捷方式文件本身未修改。部署记录：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-project-edit-20261018\desktop-deployment-final.json`。
+- 未修改用户的 `26国赛b题` 项目数据。受控代码执行和用户最终 Word 模板页面渲染仍是此前未通过/未验证的门禁；本次项目编辑验收不代表完整自动论文工作流通过。
+## 2026-10-19 Agent 运行侧栏续验
+
+- 在当前工作树执行未排除任何测试文件的完整套件：`python -m pytest tests -q --cov=mathmodel_paper_studio --cov-report=term-missing -o cache_dir=<F 盘临时目录>`，结果 **599 passed，1 skipped，677 subtests passed，82.00% coverage，exit 0**。Qt 弃用警告 90 条；唯一跳过项是 Windows junction/symlink 能力保护。`tests/unit/execution/test_windows_sandbox.py` 单独 **4 passed**；此前因模块缺失而排除它的记录已由本次未排除全量运行覆盖。
+- 新建的侧栏预览冻结包已通过构建锁、包目录和归档审计。EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-run-sidebar-20261019\release\MathModelPaperStudio\MathModelPaperStudio.exe`；SHA-256：`16A4018A464D52D1BBBEBB69EFD6A2E3DE7EF3102FEA194EDC3CAF5ABF7763A1`。归档包含 `ui.run_timeline` 和 `execution.windows_sandbox`；包目录 318 个文件、132,183,144 字节。
+- 冻结启动报告 `F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-continue-20261019\frozen-startup.json` 为 `status=ok`、`frozen=true`，Python 3.13.14，受管临时路径均在 F 盘。
+- 预览 GUI 以 PID 60200 在运行，窗口标题“数模论文工作台”，使用临时空数据目录 `F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-continue-20261019\preview-data`。桌面快捷方式和现有发布目录未更改；未发送真实 Codex/DeepSeek 请求，未运行生成代码，Windows 沙箱的单元配置测试不等同于实际隔离执行验收。

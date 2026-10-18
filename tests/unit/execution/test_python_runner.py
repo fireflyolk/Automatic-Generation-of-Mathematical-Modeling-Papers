@@ -32,7 +32,7 @@ class ComputationLimitsTests(unittest.TestCase):
     def test_defaults_are_finite_and_bounded(self):
         limits = ComputationLimits()
         self.assertGreater(limits.wall_seconds, 0)
-        self.assertGreater(limits.memory_bytes, 0)
+        self.assertEqual(2 * 1024 ** 3, limits.memory_bytes)
         self.assertGreater(limits.stdout_bytes, 0)
         self.assertGreater(limits.artifact_bytes, 0)
 

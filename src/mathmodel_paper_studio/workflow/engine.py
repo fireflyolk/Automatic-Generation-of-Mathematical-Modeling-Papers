@@ -12,6 +12,7 @@ from mathmodel_paper_studio.workflow.checkpoint import (
 )
 from mathmodel_paper_studio.workflow.context_builder import ContextBuilder, ContextInputError, StageContext
 from mathmodel_paper_studio.workflow.retry_policy import RetryPolicy
+from mathmodel_paper_studio.workflow.progress import ProgressKind, RunProgressReporter
 from mathmodel_paper_studio.workflow.stages import (
     ArtifactDigest, PauseReason, StageOutput, StageResult, WorkflowState,
 )
@@ -44,8 +45,10 @@ class WorkflowEngine:
         self.retry_policy = retry_policy
 
     def start(self, project_id: str, run_id: str, sources, selected_source_ids,
-              *, cancel_event: threading.Event | None = None) -> WorkflowState:
+              *, cancel_event: threading.Event | None = None,
+              progress: RunProgressReporter | None = None) -> WorkflowState:
         self._validate_cancel_event(cancel_event)
+        self._validate_progress(progress, run_id)
         project, run = self._records(project_id, run_id)
         if run.status is RunStatus.CREATED:
             project_root = validate_managed_path(self.paths.root / project.relative_path)
@@ -62,14 +65,18 @@ class WorkflowEngine:
             state = self._recover_or_pause(run, store)
             if run.status in (RunStatus.PAUSED, RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED):
                 return state
-        return self._drive(project, run_id, sources, selected_source_ids, layout, store, state, cancel_event)
+        self._emit_progress(progress, ProgressKind.RUN_STARTED, '运行已启动')
+        return self._drive(project, run_id, sources, selected_source_ids,
+                           layout, store, state, cancel_event, progress)
 
     def resume(self, run_id: str, sources, selected_source_ids,
-               *, cancel_event: threading.Event | None = None) -> WorkflowState:
+               *, cancel_event: threading.Event | None = None,
+               progress: RunProgressReporter | None = None) -> WorkflowState:
         self._validate_cancel_event(cancel_event)
         run = self.runs.get(run_id)
         if run is None:
             raise ValueError('运行记录不存在。')
+        self._validate_progress(progress, run_id)
         project = self.projects.get(run.project_id)
         if project is None:
             raise ValueError('运行所属项目不存在。')
@@ -81,14 +88,18 @@ class WorkflowEngine:
         if state.status is RunStatus.PAUSED:
             state = state.resume()
             self._persist(store, state)
-        return self._drive(project, run_id, sources, selected_source_ids, layout, store, state, cancel_event)
+        self._emit_progress(progress, ProgressKind.RUN_STARTED, '运行已恢复')
+        return self._drive(project, run_id, sources, selected_source_ids,
+                           layout, store, state, cancel_event, progress)
 
-    def cancel(self, run_id: str) -> WorkflowState | None:
+    def cancel(self, run_id: str, *, progress: RunProgressReporter | None = None) -> WorkflowState | None:
         run = self.runs.get(run_id)
         if run is None:
             raise ValueError('运行记录不存在。')
+        self._validate_progress(progress, run_id)
         if run.status is RunStatus.CREATED:
             self.runs.update(run.transition(RunStatus.CANCELLED), expected_status=RunStatus.CREATED)
+            self._emit_progress(progress, ProgressKind.RUN_CANCELLED, '运行已取消')
             return None
         project = self.projects.get(run.project_id)
         if project is None:
@@ -100,11 +111,13 @@ class WorkflowEngine:
         except CheckpointRecoveryError:
             if run.status in (RunStatus.RUNNING, RunStatus.PAUSED):
                 self.runs.update(run.transition(RunStatus.CANCELLED), expected_status=run.status)
+                self._emit_progress(progress, ProgressKind.RUN_CANCELLED, '运行已取消')
             return None
         if state.status in (RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED):
             return state
         cancelled = state.cancel()
         self._persist(store, cancelled)
+        self._emit_progress(progress, ProgressKind.RUN_CANCELLED, '运行已取消')
         return cancelled
 
     def reconcile_duplicate_delivery(self, run_id: str, result: StageResult) -> WorkflowState:
@@ -138,6 +151,67 @@ class WorkflowEngine:
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise TypeError('取消信号类型无效。')
 
+    @staticmethod
+    def _validate_progress(progress, run_id):
+        if progress is not None and (not isinstance(progress, RunProgressReporter)
+                                     or progress.run_id != run_id):
+            raise TypeError('运行进度接收器与运行标识不匹配。')
+
+    @staticmethod
+    def _emit_progress(progress, kind, title, **kwargs):
+        if progress is None:
+            return
+        try:
+            progress.emit(kind, title, **kwargs)
+        except Exception:
+            # Rendering is observational and must never affect the workflow transaction.
+            return
+
+    def _emit_stage_started(self, progress, stage, attempt):
+        self._emit_progress(progress, ProgressKind.STAGE_STARTED, f'{stage.value} 阶段开始',
+                            stage=stage, attempt=attempt)
+        if stage in (Stage.RESULT_VALIDATION, Stage.DOCX_QA):
+            self._emit_progress(progress, ProgressKind.VALIDATION_STARTED, '开始校验阶段结果',
+                                stage=stage, attempt=attempt)
+
+    def _emit_stage_result(self, progress, result, artifacts):
+        status_event = {
+            StageStatus.COMPLETED: (ProgressKind.STAGE_COMPLETED, '阶段已完成'),
+            StageStatus.PAUSED: (ProgressKind.STAGE_PAUSED, '阶段已暂停'),
+            StageStatus.FAILED: (ProgressKind.STAGE_FAILED, '阶段执行失败'),
+            StageStatus.CANCELLED: (ProgressKind.STAGE_CANCELLED, '阶段已取消'),
+        }
+        kind, title = status_event[result.status]
+        detail = result.pause_reason.value if result.pause_reason is not None else ''
+        self._emit_progress(progress, kind, title, stage=result.stage,
+                            attempt=result.attempt, detail=detail)
+        if result.stage in (Stage.RESULT_VALIDATION, Stage.DOCX_QA):
+            if result.status is StageStatus.COMPLETED:
+                validation_kind, validation_title = ProgressKind.VALIDATION_PASSED, '校验通过'
+            elif result.status is StageStatus.CANCELLED:
+                validation_kind, validation_title = None, ''
+            else:
+                validation_kind, validation_title = ProgressKind.VALIDATION_FAILED, '校验未通过'
+            if validation_kind is not None:
+                self._emit_progress(progress, validation_kind, validation_title,
+                                    stage=result.stage, attempt=result.attempt)
+        for artifact in artifacts:
+            self._emit_progress(progress, ProgressKind.ARTIFACT_CREATED, '已提交阶段产物',
+                                stage=result.stage, attempt=result.attempt,
+                                detail=artifact.kind, artifact=artifact)
+
+    def _emit_run_terminal(self, progress, state):
+        terminal = {
+            RunStatus.PAUSED: (ProgressKind.RUN_PAUSED, '运行已暂停'),
+            RunStatus.CANCELLED: (ProgressKind.RUN_CANCELLED, '运行已取消'),
+            RunStatus.FAILED: (ProgressKind.RUN_FAILED, '运行失败'),
+            RunStatus.COMPLETED: (ProgressKind.RUN_COMPLETED, '运行已完成'),
+        }.get(state.status)
+        if terminal is not None:
+            kind, title = terminal
+            self._emit_progress(progress, kind, title, detail=(
+                state.pause_reason.value if state.pause_reason is not None else ''))
+
     def _records(self, project_id: str, run_id: str) -> tuple[Project, Run]:
         project = self.projects.get(project_id)
         run = self.runs.get(run_id)
@@ -161,7 +235,8 @@ class WorkflowEngine:
 
     def _drive(self, project: Project, run_id: str, sources, selected_source_ids,
                layout: RunArtifactLayout, store: CheckpointStore, state: WorkflowState,
-               cancel_event: threading.Event | None) -> WorkflowState:
+               cancel_event: threading.Event | None,
+               progress: RunProgressReporter | None = None) -> WorkflowState:
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise TypeError('取消信号类型无效。')
         try:
@@ -170,16 +245,23 @@ class WorkflowEngine:
                 selected_source_ids=selected_source_ids,
             )
         except ContextInputError as exc:
+            if state.next_stage is not None:
+                self._emit_stage_started(progress, state.next_stage, state.next_attempt)
             result = StageResult(state.next_stage, state.next_attempt, StageStatus.PAUSED,
                                  diagnostic=str(exc), pause_reason=exc.reason)
-            return self._commit_result(state, result, (), layout, store)
+            state = self._commit_result(state, result, (), layout, store)
+            self._emit_stage_result(progress, result, ())
+            self._emit_run_terminal(progress, state)
+            return state
 
         while state.status is RunStatus.RUNNING and state.next_stage is not None:
             if cancel_event is not None and cancel_event.is_set():
                 state = state.cancel()
                 self._persist(store, state)
+                self._emit_run_terminal(progress, state)
                 return state
             stage, attempt = state.next_stage, state.next_attempt
+            self._emit_stage_started(progress, stage, attempt)
             delivery = state.generation + 1
             relative_directory = f'stages/{stage.value}/attempt-{attempt:02d}-delivery-{delivery:06d}'
             try:
@@ -189,7 +271,9 @@ class WorkflowEngine:
                 result = StageResult(stage, attempt, StageStatus.PAUSED,
                                      diagnostic=str(exc), pause_reason=exc.reason)
                 state = self._commit_result(state, result, (), layout, store)
+                self._emit_stage_result(progress, result, ())
                 self._after_checkpoint(state)
+                self._emit_run_terminal(progress, state)
                 return state
 
             artifact_directory = layout.path_for(relative_directory)
@@ -205,7 +289,9 @@ class WorkflowEngine:
                                      diagnostic='阶段产物目录已存在，状态不确定，未重放阶段。',
                                      pause_reason=PauseReason.OUTPUT_CONFLICT)
                 state = self._commit_result(state, result, (), layout, store)
+                self._emit_stage_result(progress, result, ())
                 self._after_checkpoint(state)
+                self._emit_run_terminal(progress, state)
                 return state
 
             if cancel_event is not None and cancel_event.is_set():
@@ -213,7 +299,8 @@ class WorkflowEngine:
                                      diagnostic='用户在阶段启动前取消。')
             else:
                 try:
-                    result = self._execute_stage(context, artifact_directory, cancel_event)
+                    result = self._execute_stage_with_progress(
+                        context, artifact_directory, cancel_event, progress)
                     if (not isinstance(result, StageResult) or result.stage is not stage
                             or result.attempt != attempt):
                         raise ValueError('adapter returned mismatched stage delivery')
@@ -226,7 +313,9 @@ class WorkflowEngine:
 
             if result.status is StageStatus.CANCELLED:
                 state = self._commit_result(state, result, (), layout, store)
+                self._emit_stage_result(progress, result, ())
                 self._after_checkpoint(state)
+                self._emit_run_terminal(progress, state)
                 return state
             try:
                 artifacts = self._write_outputs(layout, artifact_directory, state, result, delivery)
@@ -236,7 +325,9 @@ class WorkflowEngine:
                                      pause_reason=PauseReason.OUTPUT_CONFLICT)
                 artifacts = ()
             state = self._commit_result(state, result, artifacts, layout, store)
+            self._emit_stage_result(progress, result, artifacts)
             self._after_checkpoint(state)
+        self._emit_run_terminal(progress, state)
         return state
 
     def _write_outputs(self, layout: RunArtifactLayout, directory: Path, state: WorkflowState,
@@ -279,6 +370,9 @@ class WorkflowEngine:
             pause_reason=(PauseReason.PREFLIGHT_FAILED if context.stage is Stage.PREFLIGHT
                           else PauseReason.ADAPTER_UNAVAILABLE),
         )
+
+    def _execute_stage_with_progress(self, context, artifact_directory, cancel_event, progress):
+        return self._execute_stage(context, artifact_directory, cancel_event)
 
     def _after_checkpoint(self, state: WorkflowState) -> None:
         """Test seam for abrupt stage-boundary termination; production does nothing."""

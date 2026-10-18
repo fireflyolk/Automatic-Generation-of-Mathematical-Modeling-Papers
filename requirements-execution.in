@@ -1,0 +1,8 @@
+# Data-science runtime loaded only inside the offline Windows Sandbox.
+numpy
+pandas
+scipy
+matplotlib
+python-docx==1.2.0
+openpyxl==3.1.5
+pypdf==6.21.1

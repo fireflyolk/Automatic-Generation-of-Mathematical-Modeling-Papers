@@ -2,7 +2,7 @@
 from PySide6.QtCore import QThreadPool, Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout, QListWidget, QPlainTextEdit, QProgressBar, QScrollArea,
-    QVBoxLayout, QWidget,
+    QSplitter, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, PrimaryPushButton, PushButton, SubtitleLabel, TitleLabel,
@@ -12,7 +12,9 @@ from mathmodel_paper_studio.agents.preflight import Provider
 from mathmodel_paper_studio.domain.models import RunStatus
 from mathmodel_paper_studio.domain.models import StageStatus
 from mathmodel_paper_studio.ui.workers import FunctionWorker
-from mathmodel_paper_studio.workflow.stages import WORKFLOW_STAGES
+from mathmodel_paper_studio.ui.run_timeline import RunTimelineWidget
+from mathmodel_paper_studio.workflow.progress import RunProgressReporter
+from mathmodel_paper_studio.workflow.stages import PauseReason, WORKFLOW_STAGES
 
 _STATUS_TEXT = {
     RunStatus.CREATED: '等待审核', RunStatus.RUNNING: '运行中', RunStatus.PAUSED: '已暂停',
@@ -36,6 +38,8 @@ class RunPanel(QWidget):
     operation_succeeded = Signal(object)
     operation_failed = Signal(str)
     event_received = Signal(str)
+    progress_event_received = Signal(object)
+    state_changed = Signal(object)
     resume_requested = Signal(str)
     cancel_requested = Signal(str)
     artifact_access_requested = Signal()
@@ -51,6 +55,11 @@ class RunPanel(QWidget):
         self._stage_total = len(WORKFLOW_STAGES)
         self._resume_operation = None
         self._cancel_operation = None
+        self._resume_blocked_reason = ''
+        self._run_controls_locked = False
+        self._progress_reporter = None
+        self._timeline_user_collapsed = None
+        self._timeline_requested_visible = False
         self.setObjectName('runPanel')
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -116,7 +125,31 @@ class RunPanel(QWidget):
         events_layout.addWidget(self.event_view, 1)
         content_layout.addWidget(events_card, 1)
         self.content_scroll_area.setWidget(content)
-        layout.addWidget(self.content_scroll_area, 1)
+        self.run_timeline = RunTimelineWidget(self)
+        self.run_timeline.setMinimumWidth(280)
+        self.run_timeline.hide()
+        self.progress_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.progress_splitter.setObjectName('runProgressSplitter')
+        self.progress_splitter.setChildrenCollapsible(True)
+        self.content_scroll_area.setMinimumWidth(0)
+        self.progress_splitter.addWidget(self.content_scroll_area)
+        self.progress_splitter.addWidget(self.run_timeline)
+        self.progress_splitter.setStretchFactor(0, 3)
+        self.progress_splitter.setStretchFactor(1, 2)
+        self.progress_splitter.setSizes([760, 420])
+        self.progress_splitter.setCollapsible(0, True)
+        self.progress_splitter.setCollapsible(1, False)
+
+        timeline_actions = QHBoxLayout()
+        timeline_actions.addStretch(1)
+        self.timeline_toggle_button = PushButton('显示实时过程', self)
+        self.timeline_toggle_button.setObjectName('toggleRunTimeline')
+        self.timeline_toggle_button.setAccessibleName('显示或隐藏 Agent 实时运行过程')
+        timeline_actions.addWidget(self.timeline_toggle_button)
+        layout.addLayout(timeline_actions)
+        layout.addWidget(self.progress_splitter, 1)
+        self.progress_event_received.connect(self.run_timeline.append_event)
+        self.timeline_toggle_button.clicked.connect(self._toggle_timeline)
 
         artifact_row = QHBoxLayout()
         self.artifact_access_label = CaptionLabel(
@@ -147,6 +180,42 @@ class RunPanel(QWidget):
         self.cancel_button.clicked.connect(self.cancel)
         self.resume_button.clicked.connect(self.resume)
 
+    def begin_progress_run(self, run_id: str) -> RunProgressReporter:
+        run_id = str(run_id)
+        if self._progress_reporter is not None and self._progress_reporter.run_id == run_id:
+            self.set_run_id(run_id)
+            return self._progress_reporter
+        self.set_run_id(run_id)
+        self.run_timeline.reset_for_run(run_id)
+        self._progress_reporter = RunProgressReporter(
+            run_id, self.progress_event_received.emit,
+        )
+        return self._progress_reporter
+
+    def _set_timeline_visible(self, visible):
+        visible = bool(visible)
+        changed = visible != self._timeline_requested_visible
+        self._timeline_requested_visible = visible
+        self.run_timeline.setVisible(visible)
+        self.timeline_toggle_button.setText(
+            '隐藏实时过程' if visible else '显示实时过程')
+        if visible and changed:
+            width = max(320, self.progress_splitter.width())
+            side = min(460, max(280, width // 3))
+            self.progress_splitter.setSizes([max(0, width - side), side])
+
+    def _toggle_timeline(self):
+        visible = not self.run_timeline.isVisible()
+        self._timeline_user_collapsed = not visible
+        self._set_timeline_visible(visible)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._timeline_user_collapsed is None:
+            self._set_timeline_visible(self.width() >= 900)
+        else:
+            self._set_timeline_visible(not self._timeline_user_collapsed)
+
     @property
     def active_worker(self):
         return self._worker
@@ -155,8 +224,16 @@ class RunPanel(QWidget):
     def current_status(self):
         return self._current_status
 
+    @property
+    def progress_reporter(self):
+        return self._progress_reporter
+
     def set_run_id(self, run_id: str):
         self.run_id = str(run_id)
+
+    def set_run_controls_locked(self, locked: bool):
+        self._run_controls_locked = bool(locked)
+        self._refresh_controls()
 
     def set_provider(self, provider):
         try:
@@ -169,6 +246,9 @@ class RunPanel(QWidget):
 
     def set_run_state(self, status, message: str = ''):
         status = RunStatus(status)
+        if status is not RunStatus.PAUSED:
+            self._resume_blocked_reason = ''
+            self.resume_button.setToolTip('')
         self._current_status = status
         self.status_label.setText(message or _STATUS_TEXT[status])
         if status is RunStatus.RUNNING:
@@ -185,15 +265,21 @@ class RunPanel(QWidget):
         elif status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
             self.current_stage_label.setText('当前阶段：无（本次运行已结束）')
         self._refresh_controls()
+        self.state_changed.emit(status)
 
     def _refresh_controls(self):
         active = self._worker is not None
         self.cancel_button.setEnabled(
-            self._current_status in (RunStatus.CREATED, RunStatus.RUNNING, RunStatus.PAUSED)
+            not self._run_controls_locked
+            and self._current_status in (RunStatus.CREATED, RunStatus.RUNNING, RunStatus.PAUSED)
             and '正在取消' not in self.status_label.text())
-        self.resume_button.setEnabled(not active and self._current_status is RunStatus.PAUSED)
+        self.resume_button.setEnabled(
+            not self._run_controls_locked and not self._resume_blocked_reason and not active
+            and self._current_status is RunStatus.PAUSED)
 
     def set_workflow_state(self, state):
+        self._resume_blocked_reason = ''
+        self.resume_button.setToolTip('')
         self.set_run_id(state.run_id)
         self.stage_list.clear()
         for record in state.stage_records:
@@ -211,6 +297,11 @@ class RunPanel(QWidget):
         if state.pause_reason is not None:
             detail = detail or f'暂停原因：{state.pause_reason.value}'
         self.set_run_state(state.status, _STATUS_TEXT[state.status] + (f'：{detail}' if detail else ''))
+        if state.status is RunStatus.PAUSED and state.pause_reason is PauseReason.ADAPTER_UNAVAILABLE:
+            self._resume_blocked_reason = (
+                '本机受控 Python 隔离尚未通过预检，生成代码没有执行；请先完成运行环境验收。')
+            self.resume_button.setToolTip(self._resume_blocked_reason)
+        self._refresh_controls()
         if state.next_stage is not None:
             stage = _STAGE_TEXT.get(state.next_stage.value, state.next_stage.value)
             self.current_stage_label.setText(f'当前阶段：{stage}')
@@ -261,8 +352,11 @@ class RunPanel(QWidget):
         if signals is not None:
             signals.deleteLater()
         self._refresh_controls()
+        self.state_changed.emit(self._current_status)
 
     def cancel(self):
+        if self._run_controls_locked:
+            return
         if self._worker is not None:
             self._worker.cancel()
             self.status_label.setText('正在取消；当前阶段收到取消信号后会停止。')
@@ -275,7 +369,7 @@ class RunPanel(QWidget):
                 self.cancel_requested.emit(self.run_id)
 
     def resume(self):
-        if self._worker is not None:
+        if self._run_controls_locked or self._resume_blocked_reason or self._worker is not None:
             return
         if self._resume_operation is not None:
             self._launch(self._resume_operation)

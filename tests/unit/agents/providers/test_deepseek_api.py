@@ -1,12 +1,15 @@
 import json
+import os
 import socket
 import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mathmodel_paper_studio.agents.preflight import Provider, UnavailableReason
+from mathmodel_paper_studio.agents.protocol import EventKind
+from mathmodel_paper_studio.agents.deepseek_model_preferences import DeepSeekModelPreference
 from mathmodel_paper_studio.agents.providers.deepseek_api import (
     DeepSeekApiClient,
     ENDPOINT,
@@ -81,6 +84,88 @@ def make_context():
     )
 
 
+class DeepSeekEnvironmentKeyTests(unittest.TestCase):
+    def registry(self, value=API_KEY, value_type=1):
+        registry = MagicMock()
+        registry.REG_SZ = 1
+        registry.REG_EXPAND_SZ = 2
+        registry.QueryValueEx.return_value = (value, value_type)
+        return registry
+
+    def test_process_key_takes_precedence_without_reading_user_registry(self):
+        registry = self.registry()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'process-test-key'}), \
+                patch('sys.platform', 'win32'), \
+                patch.dict('sys.modules', {'winreg': registry}):
+            client = DeepSeekApiClient()
+            self.assertEqual('process-test-key', client._resolve_key())
+            self.assertTrue(client.probe().available)
+        registry.OpenKey.assert_not_called()
+
+    def test_missing_process_key_uses_user_environment_read_only(self):
+        registry = self.registry()
+        with patch.dict(os.environ, {}, clear=True), \
+                patch('sys.platform', 'win32'), \
+                patch.dict('sys.modules', {'winreg': registry}):
+            before = dict(os.environ)
+            client = DeepSeekApiClient()
+            self.assertEqual(API_KEY, client._resolve_key())
+            status = client.probe()
+            self.assertEqual(before, dict(os.environ))
+        registry.OpenKey.assert_called_with(
+            registry.HKEY_CURRENT_USER, 'Environment', 0, registry.KEY_QUERY_VALUE)
+        registry.QueryValueEx.assert_called_with(
+            registry.OpenKey.return_value.__enter__.return_value, 'DEEPSEEK_API_KEY')
+        registry.SetValueEx.assert_not_called()
+        registry.CreateKey.assert_not_called()
+        self.assertTrue(status.available)
+        self.assertFalse(status.evidence_verified)
+        self.assertNotIn(API_KEY, repr(status))
+
+    def test_explicit_empty_process_key_does_not_fall_back_to_other_credentials(self):
+        registry = self.registry()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': ''}), \
+                patch('sys.platform', 'win32'), \
+                patch.dict('sys.modules', {'winreg': registry}):
+            self.assertFalse(DeepSeekApiClient().probe().available)
+        registry.OpenKey.assert_not_called()
+
+    def test_non_windows_missing_key_does_not_read_registry(self):
+        registry = self.registry()
+        with patch.dict(os.environ, {}, clear=True), \
+                patch('sys.platform', 'linux'), \
+                patch.dict('sys.modules', {'winreg': registry}):
+            self.assertFalse(DeepSeekApiClient().probe().available)
+        registry.OpenKey.assert_not_called()
+
+    def test_registry_errors_and_non_string_values_fail_closed_without_secret_text(self):
+        registries = [self.registry(value=123, value_type=4), self.registry(), self.registry()]
+        registries[1].OpenKey.side_effect = OSError(API_KEY)
+        registries[2].QueryValueEx.side_effect = OSError(API_KEY)
+        for registry in registries:
+            with self.subTest(registry=registry), patch.dict(os.environ, {}, clear=True), \
+                    patch('sys.platform', 'win32'), \
+                    patch.dict('sys.modules', {'winreg': registry}):
+                status = DeepSeekApiClient().probe()
+                self.assertFalse(status.available)
+                self.assertNotIn(API_KEY, repr(status))
+
+    def test_unavailable_windows_registry_module_returns_no_key(self):
+        with patch.dict(os.environ, {}, clear=True), patch('sys.platform', 'win32'), \
+                patch.dict('sys.modules', {'winreg': None}):
+            status = DeepSeekApiClient().probe()
+        self.assertFalse(status.available)
+        self.assertIs(status.reason, UnavailableReason.API_KEY_REQUIRED)
+
+    def test_injected_resolver_does_not_read_environment_or_registry(self):
+        registry = self.registry()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': API_KEY}), \
+                patch('sys.platform', 'win32'), \
+                patch.dict('sys.modules', {'winreg': registry}):
+            self.assertIsNone(DeepSeekApiClient(key_resolver=lambda: None)._resolve_key())
+        registry.OpenKey.assert_not_called()
+
+
 class DeepSeekProbeAndConsentTests(unittest.TestCase):
     def test_probe_is_local_only_and_reports_key_presence_without_authorizing(self):
         connection_factory = unittest.mock.Mock(side_effect=AssertionError('network forbidden in probe'))
@@ -145,6 +230,40 @@ class DeepSeekProbeAndConsentTests(unittest.TestCase):
         client.revoke_chargeable_requests('run_1')
         client.authorize_chargeable_requests('run_2')
 
+    def test_run_authorization_snapshots_model_preference_until_consent_is_revoked(self):
+        selected = [DeepSeekModelPreference('deepseek-flash', 'high')]
+        connections = []
+
+        def factory(*args):
+            connection = FakeConnection()
+            connections.append(connection)
+            return connection
+
+        client = DeepSeekApiClient(
+            key_resolver=lambda: API_KEY,
+            transport_factory=factory,
+            preference_resolver=lambda: selected[0],
+        )
+        client.authorize_chargeable_requests('run_1')
+        self.assertEqual(selected[0], client.authorized_model_preference('run_1'))
+        self.assertIsNone(client.authorized_model_preference('run_2'))
+        selected[0] = DeepSeekModelPreference('deepseek-v4-pro', 'max')
+
+        client.generate(make_context(), 'prompt')
+        sent = json.loads(connections[0].request_args[2].decode('utf-8'))
+        self.assertEqual(sent['model'], 'deepseek-flash')
+        self.assertEqual(sent['reasoning_effort'], 'high')
+
+        client.revoke_chargeable_requests('run_1')
+        self.assertIsNone(client.authorized_model_preference('run_1'))
+        client.authorize_chargeable_requests('run_2')
+        context = make_context()
+        context.run_id = 'run_2'
+        client.generate(context, 'prompt')
+        sent = json.loads(connections[1].request_args[2].decode('utf-8'))
+        self.assertEqual(sent['model'], 'deepseek-v4-pro')
+        self.assertEqual(sent['reasoning_effort'], 'max')
+
     def test_probe_key_resolver_failure_is_generic(self):
         client = DeepSeekApiClient(key_resolver=lambda: (_ for _ in ()).throw(RuntimeError(API_KEY)),
                                    transport_factory=lambda *args: self.fail('network forbidden'))
@@ -168,6 +287,52 @@ class DeepSeekRequestTests(unittest.TestCase):
         client.authorize_chargeable_requests('run_1')
         return client, seen
 
+    def test_model_catalog_uses_authenticated_bounded_get_without_prompt_data(self):
+        catalog = json.dumps({
+            'object': 'list',
+            'data': [
+                {'id': 'deepseek-flash', 'object': 'model', 'owned_by': 'deepseek',
+                 'name': 'DeepSeek Flash', 'input_modalities': ['text', 'image'],
+                 'output_modalities': ['text'],
+                 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
+                {'id': 'deepseek-v4-pro', 'object': 'model', 'owned_by': 'deepseek',
+                 'name': 'DeepSeek Pro', 'input_modalities': ['text'],
+                 'output_modalities': ['text'],
+                 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
+                {'id': 'image-only', 'object': 'model', 'owned_by': 'deepseek',
+                 'name': 'Image only', 'input_modalities': ['image'], 'output_modalities': ['text']},
+            ],
+        })
+        connection = FakeConnection(FakeResponse(catalog))
+        client = DeepSeekApiClient(key_resolver=lambda: API_KEY,
+                                   transport_factory=lambda *args: connection)
+
+        models = client.list_models()
+
+        self.assertEqual([model.id for model in models], ['deepseek-flash', 'deepseek-v4-pro'])
+        self.assertEqual(models[0].display_name, 'DeepSeek Flash')
+        self.assertEqual(models[0].supported_efforts, ('low', 'high', 'max'))
+        method, path, body, headers = connection.request_args
+        self.assertEqual((method, path), ('GET', '/models'))
+        self.assertIsNone(body)
+        self.assertEqual(headers['Authorization'], 'Bearer ' + API_KEY)
+        self.assertNotIn('题目', repr(connection.request_args))
+        self.assertTrue(connection.closed)
+
+    def test_model_catalog_fails_closed_without_key_or_for_unsafe_catalog(self):
+        transport = unittest.mock.Mock(side_effect=AssertionError('no key must not connect'))
+        client = DeepSeekApiClient(key_resolver=lambda: None, transport_factory=transport)
+        with self.assertRaisesRegex(ValueError, 'DEEPSEEK_API_KEY'):
+            client.list_models()
+        transport.assert_not_called()
+
+        malformed = FakeConnection(FakeResponse('{"object":"list","data":[],"data":[]}'))
+        client = DeepSeekApiClient(key_resolver=lambda: API_KEY,
+                                   transport_factory=lambda *args: malformed)
+        with self.assertRaises(ValueError):
+            client.list_models()
+        self.assertTrue(malformed.closed)
+
     def test_fixed_https_request_has_bounded_context_and_no_tools_or_redirect_following(self):
         connection = FakeConnection()
         client, seen = self.make_client(connection)
@@ -186,6 +351,7 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertEqual(ENDPOINT, 'https://api.deepseek.com/chat/completions')
         payload = json.loads(raw_body.decode('utf-8'))
         self.assertEqual(payload['model'], MODEL)
+        self.assertEqual(payload['reasoning_effort'], 'high')
         self.assertFalse(payload['stream'])
         self.assertNotIn('tools', payload)
         self.assertNotIn('tool_choice', payload)
@@ -281,12 +447,59 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertEqual(scope.provider, 'DeepSeek')
         self.assertEqual(scope.endpoint, ENDPOINT)
         self.assertEqual(scope.model, MODEL)
+        self.assertIn('推理强度：high', scope.notice)
         self.assertIn('00_inputs/data.csv', scope.selected_inputs)
         self.assertIn('题目', ' '.join(scope.data_categories))
         self.assertFalse(scope.tools_enabled)
         self.assertTrue(scope.billable)
         self.assertNotIn('secret prompt body', repr(scope))
 
+
+    def test_deepseek_progress_drops_cancelled_or_invalid_responses(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        client, _ = self.make_client(FakeConnection())
+        cancelled_events = []
+        with self.assertRaises(RuntimeError):
+            client.generate_with_progress(
+                make_context(), 'prompt', cancel_event=cancelled,
+                event_callback=cancelled_events.append,
+            )
+        self.assertFalse(any(event.kind in (EventKind.TEXT, EventKind.COMPLETED)
+                             for event in cancelled_events))
+        self.assertEqual(EventKind.CANCELLED, cancelled_events[-1].kind)
+
+        invalid = FakeConnection(FakeResponse('{"choices":[]}'))
+        client, _ = self.make_client(invalid)
+        invalid_events = []
+        with self.assertRaises(ValueError):
+            client.generate_with_progress(
+                make_context(), 'prompt', event_callback=invalid_events.append,
+            )
+        self.assertTrue(any(event.kind is EventKind.STARTED for event in invalid_events))
+        self.assertFalse(any(event.kind in (EventKind.TEXT, EventKind.COMPLETED)
+                             for event in invalid_events))
+        self.assertEqual(EventKind.FAILED, invalid_events[-1].kind)
+        self.assertNotIn(API_KEY, repr(invalid_events))
+
+    def test_deepseek_progress_redacts_prompt_echo_and_waits_only_after_send(self):
+        connection = FakeConnection(FakeResponse(chat_response('prompt')))
+        client, _ = self.make_client(connection)
+        events = []
+        sent_at_wait = []
+
+        def sink(event):
+            if event.kind is EventKind.STARTED:
+                sent_at_wait.append(connection.request_args is not None)
+            events.append(event)
+
+        client.generate_with_progress(make_context(), 'prompt', event_callback=sink)
+
+        visible = ''.join(event.text for event in events if event.kind is EventKind.TEXT)
+        self.assertNotEqual('prompt', visible)
+        self.assertIn('[已隐藏]', visible)
+        self.assertEqual([True], sent_at_wait)
+        self.assertEqual(EventKind.COMPLETED, events[-1].kind)
 
 class DeepSeekCancellationTests(unittest.TestCase):
     def test_revoke_during_tls_handshake_closes_published_tls_socket(self):
@@ -545,3 +758,5 @@ class _ExplodingConnection(FakeConnection):
 
 if __name__ == '__main__':
     unittest.main()
+
+

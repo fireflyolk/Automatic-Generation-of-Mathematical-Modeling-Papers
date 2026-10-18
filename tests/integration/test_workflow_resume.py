@@ -17,9 +17,10 @@ from mathmodel_paper_studio.storage.repositories import ProjectRepository, Recor
 from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
 from mathmodel_paper_studio.workflow.checkpoint import CheckpointConflictError, CheckpointRecoveryError, CheckpointStore
 from mathmodel_paper_studio.workflow.engine import WorkflowDeliveryConflictError, WorkflowEngine
+from mathmodel_paper_studio.workflow.progress import ProgressKind, RunProgressReporter
 from mathmodel_paper_studio.workflow.stages import PauseReason, StageOutput, StageResult, WORKFLOW_STAGES
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\workflow-resume')
 
 
 class FakeWorkflowEngine(WorkflowEngine):
@@ -47,6 +48,7 @@ class FakeWorkflowEngine(WorkflowEngine):
 
 
 def make_fixture(test):
+    ROOT.mkdir(parents=True, exist_ok=True)
     test.temp = tempfile.TemporaryDirectory(dir=ROOT)
     test.addCleanup(test.temp.cleanup)
     paths = AppPaths(Path(test.temp.name) / 'app')
@@ -111,6 +113,43 @@ class WorkflowResumeTests(unittest.TestCase):
         duplicate = resumed.start(self.project.project_id, self.run.run_id, self.sources, self.selected)
         self.assertEqual(generation, duplicate.generation)
         self.assertEqual(list(WORKFLOW_STAGES), [stage for stage, _ in events])
+
+    def test_resume_continues_progress_sequence_without_serializing_event_history(self):
+        progress_events = []
+        reporter = RunProgressReporter(self.run.run_id, progress_events.append)
+        reporter.emit(ProgressKind.AGENT_MESSAGE, '会话内测试事件',
+                      detail='SIDEBAR_MEMORY_ONLY_MARKER')
+        blocked = FakeWorkflowEngine(
+            self.paths, self.projects, self.runs,
+            responses={Stage.PREFLIGHT: [(StageStatus.PAUSED, PauseReason.AUTH_REQUIRED)]},
+        )
+
+        paused = blocked.start(
+            self.project.project_id, self.run.run_id, self.sources, self.selected,
+            progress=reporter,
+        )
+        self.assertEqual(RunStatus.PAUSED, paused.status)
+        first_count = len(progress_events)
+        resumed = FakeWorkflowEngine(self.paths, self.projects, self.runs).resume(
+            self.run.run_id, self.sources, self.selected, progress=reporter,
+        )
+
+        self.assertEqual(RunStatus.COMPLETED, resumed.status)
+        self.assertGreater(len(progress_events), first_count)
+        self.assertEqual(list(range(1, len(progress_events) + 1)),
+                         [event.sequence for event in progress_events])
+        self.assertGreaterEqual(sum(event.kind is ProgressKind.RUN_STARTED
+                                    for event in progress_events), 2)
+
+        run_record = self.runs.get(self.run.run_id)
+        layout = RunArtifactLayout(self.paths, self.projects.get(self.project.project_id), run_record)
+        checkpoint_path = next(
+            path for path in layout.root.glob('checkpoint-v*.json')
+            if hashlib.sha256(path.read_bytes()).hexdigest() == run_record.checkpoint_sha256
+        )
+        serialized = checkpoint_path.read_text(encoding='utf-8')
+        self.assertNotIn('SIDEBAR_MEMORY_ONLY_MARKER', serialized)
+        self.assertNotIn('progress_events', serialized)
 
     def test_hard_process_exit_after_checkpoint_recovers_in_new_process(self):
         worker = Path(self.temp.name) / 'kill_after_checkpoint.py'

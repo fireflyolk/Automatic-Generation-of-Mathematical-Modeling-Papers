@@ -7,7 +7,7 @@ name = "mathmodel-paper-studio"
 version = "0.1.0"
 description = "Windows 数模论文工作台"
 requires-python = ">=3.11,<3.14"
-dependencies = ["PySide6==6.8.2.1", "PySide6-Fluent-Widgets==1.11.3", "PySideSix-Frameless-Window==0.8.2", "darkdetect==0.8.0", "pywin32==312; sys_platform == 'win32'", "openpyxl==3.1.5", "defusedxml==0.7.1", "et-xmlfile==2.0.0"]
+dependencies = ["PySide6==6.8.2.1", "PySide6-Fluent-Widgets==1.11.3", "PySideSix-Frameless-Window==0.8.2", "darkdetect==0.8.0", "pywin32==312; sys_platform == 'win32'", "openpyxl==3.1.5", "defusedxml==0.7.1", "et-xmlfile==2.0.0", "pypdf==6.21.1"]
 
 [project.scripts]
 mathmodel-paper-studio = "mathmodel_paper_studio.__main__:main"

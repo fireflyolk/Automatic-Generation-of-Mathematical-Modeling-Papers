@@ -40,6 +40,34 @@ class ProjectRepository:
         with self.database.connect() as connection:
             return tuple(_project(row) for row in connection.execute('SELECT * FROM projects ORDER BY project_id'))
 
+    def delete(self, project_id: str, *, before_delete=None) -> Project | None:
+        """Delete a project atomically, optionally staging its files after run checks."""
+        identifier(project_id)
+        if before_delete is not None and not callable(before_delete):
+            raise TypeError('项目删除准备回调必须可调用。')
+        with self.database.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            project = _project(connection.execute(
+                'SELECT * FROM projects WHERE project_id = ?', (project_id,),
+            ).fetchone())
+            if project is None:
+                return None
+            unfinished = connection.execute(
+                "SELECT 1 FROM runs WHERE project_id = ? AND status IN (?, ?) LIMIT 1",
+                (project_id, RunStatus.CREATED.value, RunStatus.RUNNING.value),
+            ).fetchone()
+            if unfinished is not None:
+                raise RecordConflictError('项目仍有未结束的运行任务，不能删除。')
+            if before_delete is not None:
+                before_delete(project)
+            connection.execute('DELETE FROM runs WHERE project_id = ?', (project_id,))
+            changed = connection.execute(
+                'DELETE FROM projects WHERE project_id = ?', (project_id,),
+            ).rowcount
+            if changed != 1:
+                raise RecordConflictError('项目记录已变化，请刷新列表后重试。')
+            return project
+
 
 class RunRepository:
     def __init__(self, database: Database):

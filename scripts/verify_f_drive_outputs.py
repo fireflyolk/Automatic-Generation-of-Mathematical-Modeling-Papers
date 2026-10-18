@@ -24,11 +24,13 @@ _SENSITIVE_NAMES = frozenset((
     ".claude.json", ".netrc", "_netrc",
 ))
 _SECRET = re.compile(
-    rb"sk-[A-Za-z0-9_-]{24,}|AKIA[A-Z0-9]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/]{32,}={0,2}[\r\n]"
-    rb"|(?:api[_-]?key|access[_-]?token|password)\s*[=:]\s*[\"']?[A-Za-z0-9_./+-]{24,}",
+    rb"sk-[A-Za-z0-9_-]{40,}|(?<![A-Za-z0-9_-])AKIA[A-Z0-9]{16}(?![A-Za-z0-9_-])|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/]{32,}={0,2}[\r\n]"
+    rb"|(?:api[_-]?key|access[_-]?token|password)[ \t]*[=:][ \t]*[\"'][A-Za-z0-9_./+-]{24,}[\"']"
+    rb"|(?m:^[ \t]*(?:api[_-]?key|access[_-]?token|password)[ \t]*[=:][ \t]*[A-Za-z0-9_./+-]{24,}[ \t]*(?:#.*)?$)",
     re.IGNORECASE,
 )
-_PIN = re.compile(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9.+!-]+)(?:\s+--hash=sha256:[a-f0-9]{64})*$")
+_PIN = re.compile(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9.+!-]+)$")
+_HASH = re.compile(r"^--hash=sha256:[a-fA-F0-9]{64}$")
 _MAX_FILES = 50000
 _MAX_FILE_BYTES = 1024 * 1024 * 1024
 
@@ -79,16 +81,31 @@ def inventory_tree(root):
     return tuple(sorted(records, key=lambda item: item["path"]))
 
 
-def read_lock(path):
+def read_lock(path, *, require_hashes=False):
     path = validate_managed_path(Path(path))
-    records = []
-    for line in path.read_text("utf-8").splitlines():
-        line = line.strip()
+    logical_lines = []
+    continuation = []
+    for raw_line in path.read_text("utf-8").splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        match = _PIN.fullmatch(line)
+        continued = line.endswith("\\")
+        continuation.append(line[:-1].rstrip() if continued else line)
+        if not continued:
+            logical_lines.append(" ".join(continuation))
+            continuation = []
+    if continuation:
+        raise ValueError("Lock file ends with an incomplete continuation.")
+    records = []
+    for line in logical_lines:
+        tokens = line.split()
+        match = _PIN.fullmatch(tokens[0]) if tokens else None
         if match is None:
             raise ValueError("Lock file contains an unpinned or unsupported requirement.")
+        if any(_HASH.fullmatch(token) is None for token in tokens[1:]):
+            raise ValueError("Lock file contains an invalid hash entry.")
+        if require_hashes and not any(_HASH.fullmatch(token) for token in tokens[1:]):
+            raise ValueError("Trusted runtime lock entries must include SHA-256 hashes.")
         records.append((match[1], match[2]))
     normalized = tuple(name.lower().replace("_", "-") for name, _ in records)
     if not records or len(set(normalized)) != len(records):
@@ -96,9 +113,9 @@ def read_lock(path):
     return tuple(records)
 
 
-def verify_lock(path):
+def verify_lock(path, *, require_hashes=False):
     versions = []
-    for name, expected in read_lock(path):
+    for name, expected in read_lock(path, require_hashes=require_hashes):
         actual = importlib.metadata.version(name)
         if actual != expected:
             raise ValueError("Locked dependency mismatch: " + name)
@@ -211,13 +228,21 @@ def main(argv=None):
     parser.add_argument("--startup-check", action="store_true")
     parser.add_argument("--report")
     parser.add_argument("--inventory-root")
+    parser.add_argument("--trusted-runtime-lock")
     parser.add_argument("--verify-lock")
     parser.add_argument("--licenses")
     parser.add_argument("--archive")
     args = parser.parse_args(argv)
     try:
         if args.inventory_root:
-            payload = {"files": inventory_tree(args.inventory_root)}
+            if args.trusted_runtime_lock:
+                versions = verify_lock(args.trusted_runtime_lock, require_hashes=True)
+                payload = {
+                    "files": inventory_tree(args.inventory_root),
+                    "trusted_runtime_dependencies": versions,
+                }
+            else:
+                payload = {"files": inventory_tree(args.inventory_root)}
         elif args.verify_lock:
             versions = verify_lock(args.verify_lock)
             payload = {"dependencies": versions}

@@ -187,25 +187,50 @@ class ComputationOutcome:
     exit_code: int | None = None
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    artifacts: tuple[ArtifactEvidence, ...] = ()
 
 
 class PythonRunner:
-    """Persist generated source for review, then pause without executing it."""
+    """Persist generated source and delegate execution only to a verified backend."""
 
-    def __init__(self, limits: ComputationLimits = ComputationLimits()):
+    def __init__(self, limits: ComputationLimits = ComputationLimits(), *, executor=None):
         if not isinstance(limits, ComputationLimits):
             raise TypeError('计算限制类型无效。')
+        if executor is not None and not callable(getattr(executor, 'execute', None)):
+            raise TypeError('计算执行后端接口无效。')
         self.limits = limits
+        self.executor = executor
+
+    def available(self) -> tuple[bool, str]:
+        if self.executor is None:
+            return False, _BLOCKED_REASON
+        checker = getattr(self.executor, 'available', None)
+        if not callable(checker):
+            return False, '计算执行后端未提供预检。'
+        result = checker()
+        if (not isinstance(result, tuple) or len(result) != 2 or type(result[0]) is not bool
+                or not isinstance(result[1], str)):
+            return False, '计算执行后端预检响应无效。'
+        return result
 
     def run(self, layout: RunArtifactLayout, source: str, *, input_files: tuple[Path, ...] = (),
             deterministic_seed: int = 0, attempt: int = 0,
-            cancel_event: threading.Event | None = None) -> ComputationOutcome:
+            cancel_event: threading.Event | None = None,
+            expected_outputs: tuple = (), input_hashes: tuple[str, ...] | None = None) -> ComputationOutcome:
         if not isinstance(layout, RunArtifactLayout):
             raise TypeError('计算请求必须使用经过检查的运行工件布局。')
         if type(attempt) is not int or attempt < 0:
             raise ValueError('计算尝试编号必须是非负整数。')
         if not isinstance(input_files, tuple) or any(not isinstance(path, Path) for path in input_files):
             raise TypeError('计算输入必须是 Path 元组。')
+        if input_hashes is not None and (
+                not isinstance(input_hashes, tuple) or len(input_hashes) != len(input_files)
+                or any(not isinstance(digest, str) or len(digest) != 64
+                       or any(character not in '0123456789abcdefABCDEF' for character in digest)
+                       for digest in input_hashes)):
+            raise ValueError('计算输入哈希清单无效。')
+        if not isinstance(expected_outputs, tuple):
+            raise TypeError('计算输出计划必须是不可变元组。')
         project_root = validate_managed_path(layout.paths.root / layout.project.relative_path)
         resolved_project = project_root.resolve(strict=False)
         for input_path in input_files:
@@ -225,7 +250,9 @@ class PythonRunner:
             raise ValueError('生成脚本为空或超过源文件上限。')
 
         cancelled = cancel_event is not None and cancel_event.is_set()
-        summary_path = layout.path_for('40_results/execution-v0001.json')
+        summary_version = attempt + 1
+        summary_relative = f'40_results/execution-v{summary_version:04d}.json'
+        summary_path = layout.path_for(summary_relative)
         if summary_path.exists():
             raise FileExistsError('该运行已有执行记录，不能追加或覆盖。')
         script_path = None
@@ -233,38 +260,73 @@ class PythonRunner:
         status = StageStatus.CANCELLED if cancelled else StageStatus.PAUSED
         reason = _CANCELLED_REASON if cancelled else _BLOCKED_REASON
         if not cancelled:
-            script_path = layout.path_for('30_src/generated.py')
+            script_name = 'generated.py' if attempt == 0 else f'generated-v{summary_version:04d}.py'
+            script_path = layout.path_for(f'30_src/{script_name}')
             if script_path.exists():
                 raise FileExistsError('该运行已有生成脚本，不能覆盖。')
             _atomic_create(script_path, source_bytes)
-            script_evidence = _evidence(layout, '30_src/generated.py', 'script', script_path)
+            script_evidence = _evidence(
+                layout, script_path.relative_to(layout.root).as_posix(), 'script', script_path,
+            )
 
 
+        status = StageStatus.CANCELLED if cancelled else StageStatus.PAUSED
+        reason = _CANCELLED_REASON if cancelled else _BLOCKED_REASON
+        execution_started = False
+        command = ()
+        interpreter = None
+        dependency_fingerprint = None
+        exit_code = None
+        artifacts = ()
+        if not cancelled and self.executor is not None:
+            from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
+            if (not expected_outputs or any(not isinstance(item, ArtifactExpectation)
+                                            for item in expected_outputs)):
+                status = StageStatus.PAUSED
+                reason = '没有可供隔离运行器验证的输出计划。'
+            else:
+                result = self.executor.execute(
+                    layout, script_path, input_files, expected_outputs,
+                    memory_mib=self.limits.memory_bytes // (1024 * 1024),
+                    wall_seconds=self.limits.wall_seconds,
+                    artifact_bytes=self.limits.artifact_bytes,
+                    cancel_event=cancel_event,
+                    expected_input_hashes=input_hashes,
+                )
+                status = StageStatus(result.stage_status)
+                execution_started = result.execution_started is True
+                reason = result.blocked_reason
+                command = tuple(result.command)
+                interpreter = result.interpreter
+                dependency_fingerprint = result.dependency_fingerprint
+                exit_code = result.exit_code
+                artifacts = tuple(result.artifacts)
         summary = {
             'schema_version': 1,
             'run_id': layout.run.run_id,
             'stage_status': status.value,
             'reason': reason,
-            'execution_started': False,
+            'execution_started': execution_started,
             'deterministic_seed': deterministic_seed,
             'script': None if script_evidence is None else {
                 'evidence_id': script_evidence.evidence_id,
                 'relative_path': script_evidence.relative_path,
                 'sha256': script_evidence.sha256,
             },
-            'interpreter': None,
-            'dependency_fingerprint': None,
-            'command': [],
-            'exit_code': None,
+            'interpreter': interpreter,
+            'dependency_fingerprint': dependency_fingerprint,
+            'command': list(command),
+            'exit_code': exit_code,
             'stdout_path': None,
             'stderr_path': None,
             'resource_limits': asdict(self.limits),
         }
         _atomic_create(summary_path, json.dumps(summary, ensure_ascii=False, sort_keys=True,
                                                  separators=(',', ':')).encode('utf-8'))
-        summary_evidence = _evidence(layout, '40_results/execution-v0001.json', 'validation', summary_path)
-        return ComputationOutcome(status, False, reason, deterministic_seed, script_path, summary_path,
-                                  script_evidence, summary_evidence)
+        summary_evidence = _evidence(layout, summary_relative, 'validation', summary_path)
+        return ComputationOutcome(status, execution_started, reason, deterministic_seed, script_path, summary_path,
+                                  script_evidence, summary_evidence, command, interpreter,
+                                  dependency_fingerprint, exit_code, None, None, artifacts)
 
 
 

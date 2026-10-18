@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Onedir only: source/config/login state is never collected as data."""
 import os
+import hashlib
+import json
 from pathlib import Path
 import sys
 from PyInstaller.utils.hooks import collect_submodules
@@ -11,6 +13,21 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_pa
 validate_managed_path(project)
 build_root = validate_managed_path(Path(os.environ["MMPS_BUILD_ROOT"]))
 license_root = validate_managed_path(Path(os.environ["MMPS_LICENSE_ROOT"]))
+computation_runtime = validate_managed_path(Path(os.environ["MMPS_COMPUTATION_RUNTIME_ROOT"]))
+runtime_manifest_path = validate_managed_path(computation_runtime / "runtime-manifest.json")
+runtime_python = validate_managed_path(computation_runtime / "python.exe")
+runtime_entry = validate_managed_path(computation_runtime / "sandbox_entry.py")
+runtime_lock = validate_managed_path(project / "requirements-execution.lock")
+if not all(path.is_file() for path in (runtime_manifest_path, runtime_python, runtime_entry)):
+    raise ValueError("The locked F: computation runtime is incomplete")
+runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
+lock_digest = hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
+required_runtime_packages = {"numpy", "pandas", "scipy", "matplotlib", "python-docx",
+                             "openpyxl", "pypdf"}
+if (runtime_manifest.get("schema_version") != 1
+        or runtime_manifest.get("lock_sha256") != lock_digest
+        or not required_runtime_packages.issubset(runtime_manifest.get("packages", {}))):
+    raise ValueError("The computation runtime does not match requirements-execution.lock")
 hook = build_root / "runtime_f_drive.py"
 hook.write_text(
     "import sys, ctypes\n"
@@ -32,7 +49,8 @@ a = Analysis(
     [str(project / "scripts" / "verify_f_drive_outputs.py")],
     pathex=[str(project / "src")],
     binaries=[],
-    datas=[(str(license_root), "licenses")],
+    datas=[(str(license_root), "licenses"),
+           (str(computation_runtime), "computation-runtime")],
     hiddenimports=collect_submodules("mathmodel_paper_studio") + ["qfluentwidgets._rc.resource", "qframelesswindow._rc.resource"],
     hookspath=[], hooksconfig={}, runtime_hooks=[str(hook)],
     excludes=["tests", "pytest", "coverage", "pip", "setuptools", "docx",

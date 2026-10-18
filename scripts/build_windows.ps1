@@ -3,6 +3,8 @@ param(
     [string]$BuildRoot,
     [string]$OutputRoot,
     [string]$PythonPath,
+    [string]$TaskTemp,
+    [string]$ComputationRuntimeRoot,
     [switch]$CheckOnly,
     [switch]$LaunchSource
 )
@@ -13,7 +15,10 @@ if ([IO.Path]::GetPathRoot($projectRoot) -ne 'F:\' -or (Split-Path -Leaf $projec
     throw 'Project root must be a worktree below the approved F: workspace.'
 }
 $approvedRoot = Split-Path -Parent $projectParent
-$taskTemp = Join-Path $approvedRoot 'tmp\mathmodel-paper-studio-fluent-20261017'
+$taskTemp = if ($TaskTemp) { $TaskTemp } else { Join-Path $approvedRoot 'tmp\mathmodel-paper-studio-fluent-20261017' }
+if (!$ComputationRuntimeRoot) {
+    $ComputationRuntimeRoot = Join-Path $approvedRoot 'downloads\mathmodel-paper-studio-sandbox-20261018\computation-runtime-final'
+}
 if (!$BuildRoot) { $BuildRoot = Join-Path $taskTemp 'build' }
 if (!$OutputRoot) { $OutputRoot = Join-Path $approvedRoot 'downloads\mathmodel-paper-studio-fluent-20261017\release' }
 if (!$PythonPath) { $PythonPath = Join-Path $projectRoot '.venv\Scripts\python.exe' }
@@ -47,8 +52,15 @@ $projectRoot = Get-ValidatedFPath $projectRoot
 $BuildRoot = Get-ValidatedFPath $BuildRoot
 $OutputRoot = Get-ValidatedFPath $OutputRoot
 $taskTemp = Get-ValidatedFPath $taskTemp
+$ComputationRuntimeRoot = Get-ValidatedFPath $ComputationRuntimeRoot
 $pythonPath = Get-ValidatedFPath $PythonPath -RequireFile
 $verifier = Get-ValidatedFPath $verifier -RequireFile
+$runtimePython = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'python.exe') -RequireFile
+$runtimeManifest = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'runtime-manifest.json') -RequireFile
+$runtimeEntry = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'sandbox_entry.py') -RequireFile
+if (!(Test-Path -LiteralPath $ComputationRuntimeRoot -PathType Container)) {
+    throw 'The locked F: computation runtime directory is missing.'
+}
 $env:PYTHONPATH = Join-Path $projectRoot 'src'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 & $pythonPath -B -c "import sys; from mathmodel_paper_studio.bootstrap.paths import validate_managed_path; tuple(validate_managed_path(p) for p in sys.argv[1:])" $projectRoot $BuildRoot $OutputRoot $taskTemp $pythonPath
@@ -66,6 +78,7 @@ $env:QML_DISK_CACHE_PATH = Join-Path $taskTemp 'qml-cache'
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $taskTemp 'pyinstaller-cache'
 $env:PYTHONUTF8 = '1'
 $env:PYTHONPATH = Join-Path $projectRoot 'src'
+$env:MMPS_COMPUTATION_RUNTIME_ROOT = $ComputationRuntimeRoot
 if ($LaunchSource) {
     & $pythonPath -B $verifier
     exit $LASTEXITCODE
@@ -82,11 +95,17 @@ $licenseRoot = Join-Path $BuildRoot 'licenses'
 if ($LASTEXITCODE -ne 0) { throw 'License inventory failed.' }
 $env:MMPS_BUILD_ROOT = $BuildRoot
 $env:MMPS_LICENSE_ROOT = $licenseRoot
+$env:MMPS_COMPUTATION_RUNTIME_ROOT = $ComputationRuntimeRoot
 Push-Location -LiteralPath $projectRoot
 try {
     & $pythonPath -B -m PyInstaller --noconfirm --workpath (Join-Path $BuildRoot 'work') --distpath $OutputRoot (Join-Path $projectRoot 'packaging\mathmodel_paper_studio.spec')
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }
     $packageRoot = Join-Path $OutputRoot 'MathModelPaperStudio'
+    $packageRuntime = Join-Path $packageRoot '_internal\computation-runtime'
+    $runtimeInventory = Join-Path $OutputRoot 'computation-runtime-files.json'
+    & (Join-Path $packageRuntime 'python.exe') -B $verifier --inventory-root $packageRuntime `
+        --trusted-runtime-lock (Join-Path $projectRoot 'requirements-execution.lock') --report $runtimeInventory
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled computation runtime inventory/lock verification failed.' }
     & $pythonPath -B $verifier --inventory-root $packageRoot --report (Join-Path $OutputRoot 'package-files.json')
     if ($LASTEXITCODE -ne 0) { throw 'Package path/secret scan failed.' }
     & $pythonPath -B $verifier --archive (Join-Path $packageRoot 'MathModelPaperStudio.exe') --report (Join-Path $OutputRoot 'archive-members.json')

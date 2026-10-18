@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\task6-accessibility')
+ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\ui-accessibility')
 _CHILD_FLAG = 'MATHMODEL_FLUENT_ACCESSIBILITY_CHILD'
 
 
@@ -90,6 +90,7 @@ if os.environ.get(_CHILD_FLAG) == '1':
 
             order = (
                 wizard.title_input, wizard.problem_input,
+                wizard.import_problem_docx_button,
                 wizard.add_source_button, wizard.add_template_button,
                 wizard.file_list, wizard.remove_source_button,
                 wizard.cancel_button, wizard.create_button,
@@ -275,13 +276,20 @@ if os.environ.get(_CHILD_FLAG) == '1':
             self.addCleanup(dialog.close)
             dialog.resize(dialog.minimumWidth(), dialog.minimumHeight())
             dialog.show()
+            dialog.activateWindow()
+            self.assertTrue(QTest.qWaitForWindowActive(dialog))
             APP.processEvents()
             self.assertEqual(0, dialog.summary_view.horizontalScrollBar().maximum())
             self.assertEqual(Qt.FocusPolicy.StrongFocus, dialog.start_button.focusPolicy())
             dialog.edit_scope_button.setFocus()
+            self.assertTrue(dialog.edit_scope_button.hasFocus())
+            self.assertTrue(dialog.change_agent_button.isVisible())
             QTest.keyClick(dialog.edit_scope_button, Qt.Key.Key_Tab)
+            self.assertTrue(dialog.change_agent_button.hasFocus())
+            QTest.keyClick(dialog.change_agent_button, Qt.Key.Key_Tab)
             self.assertTrue(dialog.cancel_button.hasFocus())
-            for button in (dialog.edit_scope_button, dialog.cancel_button, dialog.start_button):
+            for button in (dialog.edit_scope_button, dialog.change_agent_button,
+                           dialog.cancel_button, dialog.start_button):
                 rect = QRect(button.mapTo(dialog, QPoint(0, 0)), button.size())
                 self.assertTrue(dialog.rect().contains(rect),
                                 f'{button.accessibleName()} 超出审核对话框：{rect!r}')
@@ -316,6 +324,26 @@ if os.environ.get(_CHILD_FLAG) == '1':
             )
             self.assertEqual(action_rects, after_scroll)
 
+        def test_sidebar_collapses_below_minimum_width_without_hiding_actions(self):
+            panel = RunPanel(thread_pool=_DeferredPool())
+            self.addCleanup(panel.close)
+            panel.resize(720, 420)
+            panel.show()
+            QTest.qWait(20)
+
+            self.assertFalse(panel.run_timeline.isVisible())
+            self.assertTrue(panel.timeline_toggle_button.isVisible())
+            actions = (panel.artifact_button, panel.cancel_button, panel.resume_button)
+            self.assertTrue(all(button.isVisible() for button in actions))
+            self.assertTrue(all(
+                panel.rect().contains(QRect(button.mapTo(panel, QPoint(0, 0)), button.size()))
+                for button in actions
+            ))
+
+            QTest.mouseClick(panel.timeline_toggle_button, Qt.MouseButton.LeftButton)
+            QTest.qWait(20)
+            self.assertTrue(panel.run_timeline.isVisible())
+
 else:
     class FluentAccessibilityResponsiveProcessTests(unittest.TestCase):
         def test_accessibility_and_responsive_contracts_in_isolated_qt_process(self):
@@ -339,6 +367,7 @@ else:
                 'test_template_error_loading_and_success_feedback_expose_state',
                 'test_1024x720_window_and_review_actions_have_no_horizontal_overflow',
                 'test_run_panel_keeps_actions_fixed_while_details_scroll',
+                'test_sidebar_collapses_below_minimum_width_without_hiding_actions',
             )
             for test_name in test_names:
                 with self.subTest(test_name=test_name):

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from tests.fixtures.docx.fixture_factory import write_fixture
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.storage.database import Database
@@ -65,3 +66,39 @@ class ProjectImportFlowTests(unittest.TestCase):
         self.assertEqual(snapshot, {p.relative_to(first_root): p.read_bytes() for p in first_root.rglob('*') if p.is_file()})
         self.assertEqual(b'invalid zip', malformed.read_bytes())
         self.assertEqual([], list(self.paths.temp.iterdir()))
+
+    def test_docx_data_and_word_template_are_copied_as_distinct_roles(self):
+        data = write_fixture(self.base / 'observations.docx')
+        template = write_fixture(self.base / 'paper-template.docx')
+
+        project = self.service.create('docx data', '分析给定文档材料', [data], template=template)
+
+        root = self.paths.root / project.relative_path
+        manifest = json.loads((root / '00_inputs/manifest-v0001.json').read_text('utf-8'))
+        roles = {entry['selected_name']: entry for entry in manifest['sources']}
+        self.assertEqual('docx_data', roles[data.name]['kind'])
+        self.assertEqual('docx', roles[template.name]['kind'])
+        data_copy = root / roles[data.name]['relative_path']
+        template_copy = root / roles[template.name]['relative_path']
+        self.assertEqual('.docx', data_copy.suffix)
+        self.assertEqual('.docx', template_copy.suffix)
+        profile = json.loads((root / '10_analysis/source-0001-profile.json').read_text('utf-8'))
+        self.assertGreater(profile['character_count'], 0)
+
+    def test_two_docx_data_attachments_are_both_copied_into_the_project(self):
+        first = write_fixture(self.base / 'problem-context.docx')
+        second = write_fixture(self.base / 'supporting-notes.docx')
+
+        project = self.service.create('two docx inputs', '分析两份材料', [first, second])
+
+        root = self.paths.root / project.relative_path
+        manifest = json.loads((root / '00_inputs/manifest-v0001.json').read_text('utf-8'))
+        by_name = {entry['selected_name']: entry for entry in manifest['sources']}
+        self.assertEqual({'problem-v0001.txt', first.name, second.name}, set(by_name))
+        self.assertEqual('docx_data', by_name[first.name]['kind'])
+        self.assertEqual('docx_data', by_name[second.name]['kind'])
+        for source in (first, second):
+            copied = root / by_name[source.name]['relative_path']
+            self.assertEqual(source.read_bytes(), copied.read_bytes())
+        profiles = sorted((root / '10_analysis').glob('source-*-profile.json'))
+        self.assertEqual(2, len(profiles))

@@ -120,7 +120,8 @@ def _parse_capabilities(raw: str, provider: Provider) -> AdapterCapabilities:
     ):
         raise ValueError("invalid credential inheritance")
     if report["tool_profile"] not in (
-        "restricted_read_write", "workspace_exec", "text_only", "api_no_tools"
+        "restricted_read_write", "workspace_exec", "text_only", "text_only_no_environment",
+        "api_no_tools"
     ):
         raise ValueError("invalid tool profile")
     if provider is Provider.CLAUDE and report["tool_profile"] not in ("restricted_read_write", "text_only"):

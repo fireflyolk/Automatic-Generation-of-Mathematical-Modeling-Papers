@@ -119,7 +119,7 @@ class SourceFile:
         sha256_digest(self.sha256)
         if type(self.size_bytes) is not int or self.size_bytes < 0:
             raise ValueError('文件大小必须是非负整数。')
-        if self.kind not in ('csv', 'xlsx', 'docx', 'problem'):
+        if self.kind not in ('csv', 'xlsx', 'docx', 'docx_data', 'problem'):
             raise ValueError('不支持的输入类型。')
 
 

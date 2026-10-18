@@ -14,6 +14,45 @@ class PathPolicyError(ValueError):
     """A path cannot be safely used as app-managed storage."""
 
 
+def _absolute_local_path(value: str | os.PathLike) -> Path:
+    raw = os.fspath(value)
+    if not isinstance(raw, str) or not raw or raw.startswith(('\\\\', '//')):
+        raise PathPolicyError('源文件必须是本地磁盘上的绝对路径（例如 C:\\...）。')
+    windows = PureWindowsPath(raw)
+    if not windows.is_absolute() or not re.fullmatch(r'[a-z]:', windows.drive, re.I):
+        raise PathPolicyError('源文件必须是本地磁盘上的绝对路径（例如 C:\\...）。')
+    components = windows.parts[1:]
+    for part in components:
+        if (part in ('', '.', '..') or part.endswith((' ', '.')) or _RESERVED.match(part)
+                or any(ord(c) < 32 or c in '<>:"|?*' for c in part)):
+            raise PathPolicyError('源文件路径包含不允许的路径段。')
+    if os.name != 'nt':
+        raise PathPolicyError('此版本需要 Windows 本地磁盘路径。')
+    return Path(windows)
+
+
+def _reject_reparse_components(path: Path, label: str) -> None:
+    """Check existing components once; a missing parent means deeper ones cannot exist."""
+    try:
+        for ancestor in (*reversed(path.parents), path):
+            try:
+                info = ancestor.lstat()
+            except FileNotFoundError:
+                break
+            if (stat.S_ISLNK(info.st_mode)
+                    or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                raise PathPolicyError(f'{label}路径经过符号链接或目录联接，请选择真实路径。')
+    except (OSError, RuntimeError) as exc:
+        raise PathPolicyError(f'无法检查{label}路径，请确认本地磁盘可访问。') from exc
+
+
+def validate_import_source_path(value: str | os.PathLike) -> Path:
+    """Validate a read-only source path on any local drive, outside app storage if needed."""
+    path = _absolute_local_path(value)
+    _reject_reparse_components(path, '源文件')
+    return path
+
+
 def _lexical_path(value: str | os.PathLike) -> Path:
     raw = os.fspath(value)
     if not isinstance(raw, str) or not raw or raw.startswith(('\\\\', '//')):
@@ -36,19 +75,9 @@ def _lexical_path(value: str | os.PathLike) -> Path:
 
 
 def validate_managed_path(value: str | os.PathLike) -> Path:
-    """Reject aliases and escapes before resolving or creating a managed path."""
+    """Reject lexical escapes and reparse-point aliases before using managed paths."""
     path = _lexical_path(value)
-    try:
-        for ancestor in (*reversed(path.parents), path):
-            if ancestor.exists() or ancestor.is_symlink():
-                info = ancestor.lstat()
-                if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-                    raise PathPolicyError('存储路径经过符号链接或目录联接，请选择真实目录。')
-        resolved = path.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise PathPolicyError('无法检查存储路径，请确认 F: 可访问。') from exc
-    if not resolved.is_relative_to(Path(APPROVED_BASE).resolve(strict=False)):
-        raise PathPolicyError('存储路径解析后离开批准的 F: 工作目录。')
+    _reject_reparse_components(path, '存储')
     return path
 
 

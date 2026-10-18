@@ -1,4 +1,4 @@
-"""Asynchronous project setup with F:-only source selection."""
+"""Asynchronous project setup with read-only imports from local drives."""
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt, Signal
@@ -13,7 +13,10 @@ from qfluentwidgets import (
     TextEdit, TitleLabel,
 )
 
-from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
+from mathmodel_paper_studio.bootstrap.paths import validate_import_source_path
+from mathmodel_paper_studio.inputs.docx_reader import read_docx
+from mathmodel_paper_studio.inputs.pdf_reader import read_pdf
+from mathmodel_paper_studio.inputs.profiling import ImportLimits, read_source_bounded
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.ui.workers import FunctionWorker
 
@@ -60,6 +63,7 @@ class ProjectWizard(QDialog):
         self.thread_pool = thread_pool or QThreadPool.globalInstance()
         self._source_files = ()
         self._template_path = None
+        self._problem_document = None
         self._worker = None
         self._worker_signals = None
         self._retry_available = False
@@ -97,23 +101,48 @@ class ProjectWizard(QDialog):
         self.problem_input.setPlaceholderText('粘贴题目全文；导入时会保留为项目输入副本。')
         self.problem_input.setMinimumHeight(110)
         self.problem_input.setTabChangesFocus(True)
+        problem_editor = QWidget(project_card)
+        problem_editor_layout = QVBoxLayout(problem_editor)
+        problem_editor_layout.setContentsMargins(0, 0, 0, 0)
+        problem_editor_layout.setSpacing(6)
+        problem_editor_layout.addWidget(self.problem_input)
+        problem_docx_actions = QHBoxLayout()
+        self.import_problem_docx_button = PushButton('从 DOCX/PDF 导入题目', problem_editor)
+        self.import_problem_docx_button.setIcon(FluentIcon.DOCUMENT)
+        self.import_problem_docx_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.import_problem_docx_button.setAccessibleName('从 DOCX 或文字版 PDF 导入题目内容')
+        self.import_problem_docx_button.setToolTip(
+            '支持本地磁盘上的 DOCX 和文字版 PDF；扫描件与图片不识别。')
+        problem_docx_actions.addWidget(self.import_problem_docx_button, 0, Qt.AlignmentFlag.AlignLeft)
+        problem_docx_actions.addStretch(1)
+        problem_editor_layout.addLayout(problem_docx_actions)
+        self.problem_docx_status = CaptionLabel(
+            '可粘贴题目，或导入 DOCX/文字版 PDF；导入后请核对公式、表格和题目全文。', problem_editor)
+        self.problem_docx_status.setObjectName('problemDocxImportStatus')
+        self.problem_docx_status.setAccessibleName('题目文档导入状态')
+        self.problem_docx_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.problem_docx_status.setWordWrap(True)
+        problem_editor_layout.addWidget(self.problem_docx_status)
         fields.addRow(BodyLabel('项目名称', project_card), self.title_input)
-        fields.addRow(BodyLabel('题目内容', project_card), self.problem_input)
+        fields.addRow(BodyLabel('题目内容', project_card), problem_editor)
         project_layout.addLayout(fields)
         content_layout.addWidget(project_card)
 
         files_card = CardWidget(content)
         files_layout = QVBoxLayout(files_card)
         files_layout.addWidget(TitleLabel('数据与 Word 模板', files_card))
-        files_layout.addWidget(CaptionLabel(
-            '选择 F: 工作区内的 CSV/XLSX 数据，可选 DOCX 模板。单次最多选择 32 个数据文件。',
+        source_help = CaptionLabel(
+            '可从任意本地磁盘（如 C:、D:、F:）导入 CSV/XLSX/DOCX，可多选最多 32 个；DOCX 模板单独选择。源文件会复制到 F: 应用数据目录，原件保持不变。',
             files_card,
-        ))
+        )
+        source_help.setWordWrap(True)
+        files_layout.addWidget(source_help)
         file_actions = QHBoxLayout()
-        self.add_source_button = PushButton('选择 CSV/XLSX', files_card)
+        self.add_source_button = PushButton('选择 CSV/XLSX/DOCX 数据', files_card)
         self.add_source_button.setIcon(FluentIcon.FOLDER)
         self.add_source_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.add_source_button.setAccessibleName('选择 CSV 或 XLSX 数据文件')
+        self.add_source_button.setAccessibleName('多选本地磁盘上的 CSV、XLSX 或 DOCX 数据文件')
+        self.add_source_button.setToolTip('可在文件选择窗口中用 Ctrl 或 Shift 多选；支持 C:、D:、F: 等本地磁盘。')
         self.add_template_button = PushButton('选择 Word 模板', files_card)
         self.add_template_button.setIcon(FluentIcon.DOCUMENT)
         self.add_template_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -182,6 +211,7 @@ class ProjectWizard(QDialog):
         outer.addLayout(buttons)
 
         self.add_source_button.clicked.connect(self._choose_sources)
+        self.import_problem_docx_button.clicked.connect(self._choose_problem_docx)
         self.add_template_button.clicked.connect(self._choose_template)
         self.remove_source_button.clicked.connect(self._remove_selected)
         self.title_input.textChanged.connect(self._inputs_changed)
@@ -189,7 +219,8 @@ class ProjectWizard(QDialog):
         self.create_button.clicked.connect(self._create)
         self.cancel_button.clicked.connect(self.reject)
         self.setTabOrder(self.title_input, self.problem_input)
-        self.setTabOrder(self.problem_input, self.add_source_button)
+        self.setTabOrder(self.problem_input, self.import_problem_docx_button)
+        self.setTabOrder(self.import_problem_docx_button, self.add_source_button)
         self.setTabOrder(self.add_source_button, self.add_template_button)
         self.setTabOrder(self.add_template_button, self.file_list)
         self.setTabOrder(self.file_list, self.remove_source_button)
@@ -222,11 +253,12 @@ class ProjectWizard(QDialog):
 
     def set_source_files(self, paths) -> None:
         try:
-            candidates = tuple(validate_managed_path(Path(item)) for item in paths)
+            candidates = tuple(validate_import_source_path(Path(item)) for item in paths)
             if len(candidates) > 32 or len({str(item).casefold() for item in candidates}) != len(candidates):
                 raise ValueError('数据文件不能重复，单次最多选择 32 个。')
-            if any(not item.is_file() or item.suffix.casefold() not in ('.csv', '.xlsx') for item in candidates):
-                raise ValueError('数据文件必须是 F: 工作区内的普通 CSV 或 XLSX 文件。')
+            if any(not item.is_file() or item.suffix.casefold() not in ('.csv', '.xlsx', '.docx')
+                   for item in candidates):
+                raise ValueError('数据文件必须是本地磁盘上的普通 CSV、XLSX 或 DOCX 文件。')
         except (OSError, TypeError, ValueError) as exc:
             self._retry_available = False
             self._set_error(f'文件范围无效：{exc}')
@@ -239,6 +271,36 @@ class ProjectWizard(QDialog):
         self._refresh_file_list()
         self._update_validity()
 
+    def set_problem_docx(self, path) -> None:
+        self.set_problem_document(path)
+
+    def set_problem_document(self, path) -> None:
+        try:
+            candidate = validate_import_source_path(Path(path))
+            extension = candidate.suffix.casefold()
+            if not candidate.is_file() or extension not in ('.docx', '.pdf'):
+                raise ValueError('题目文件必须是本地磁盘上的 DOCX 或文字版 PDF 文件。')
+            content = read_source_bounded(candidate, ImportLimits())
+            extracted = read_pdf(content) if extension == '.pdf' else read_docx(content)
+        except (OSError, TypeError, ValueError) as exc:
+            self.problem_docx_status.setText(f'题目文档导入失败：{str(exc)[:500]}')
+            return
+        self._problem_document = (candidate.name, content)
+        self.problem_input.setPlainText(extracted.text)
+        if extension == '.pdf':
+            message = f'{extracted.page_count} 页文字，{extracted.character_count} 字符'
+        else:
+            message = f'正文和表格文字（{extracted.paragraph_count} 段，{extracted.table_count} 个表格）'
+        self.problem_docx_status.setText(f'已从 {candidate.name} 导入{message}；'
+                                        '原件会复制到项目，请核对公式、表格和题目全文。扫描图片不识别。')
+
+    def _choose_problem_docx(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择题目文档', str(self.service.paths.root),
+            '题目文档 (*.docx *.pdf);;Word 文档 (*.docx);;PDF 文档 (*.pdf)')
+        if path:
+            self.set_problem_docx(path)
+
     def set_template_path(self, path) -> None:
         if path is None:
             self._template_path = None
@@ -248,9 +310,9 @@ class ProjectWizard(QDialog):
             self._update_validity()
             return
         try:
-            candidate = validate_managed_path(Path(path))
+            candidate = validate_import_source_path(Path(path))
             if not candidate.is_file() or candidate.suffix.casefold() != '.docx':
-                raise ValueError('Word 模板必须是 F: 工作区内的 DOCX 文件。')
+                raise ValueError('Word 模板必须是本地磁盘上的 DOCX 文件。')
             if any(candidate.name.casefold() == source.name.casefold() for source in self._source_files):
                 raise ValueError('模板文件不能与数据文件重名。')
         except (OSError, TypeError, ValueError) as exc:
@@ -268,7 +330,8 @@ class ProjectWizard(QDialog):
 
     def _choose_sources(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, '选择数据文件', str(self.service.paths.root), '数据文件 (*.csv *.xlsx)')
+            self, '选择 CSV/XLSX/DOCX 数据文件', str(self.service.paths.root),
+            '数据文件 (*.csv *.xlsx *.docx)')
         if paths:
             self.set_source_files(paths)
 
@@ -295,7 +358,8 @@ class ProjectWizard(QDialog):
     def _refresh_file_list(self):
         self.file_list.clear()
         for source in self._source_files:
-            self.file_list.addItem(f'数据：{source}')
+            label = 'DOCX 数据' if source.suffix.casefold() == '.docx' else '数据'
+            self.file_list.addItem(f'{label}：{source}')
             self.file_list.item(self.file_list.count() - 1).setData(256, str(source))
         if self._template_path is not None:
             self.file_list.addItem(f'Word 模板：{self._template_path}')
@@ -359,12 +423,14 @@ class ProjectWizard(QDialog):
             return
         title, problem = self.title_input.text().strip(), self.problem_input.toPlainText().strip()
         sources, template = self._source_files, self._template_path
+        problem_document = self._problem_document
         self._retry_available = False
         self._input_error = None
         self.create_button.setText('正在导入…')
         self.create_button.setAccessibleName('正在导入，请稍候')
         self.create_button.setEnabled(False)
         self.add_source_button.setEnabled(False)
+        self.import_problem_docx_button.setEnabled(False)
         self.add_template_button.setEnabled(False)
         self.remove_source_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
@@ -375,7 +441,8 @@ class ProjectWizard(QDialog):
         self.progress_label.show()
         self.import_progress.show()
         self._worker = FunctionWorker(
-            lambda cancel, emit: self.service.create(title, problem, sources, template=template))
+            lambda cancel, emit: self.service.create(title, problem, sources, template=template,
+                                                    problem_document=problem_document))
         self._worker_signals = self._worker.signals
         self._worker_signals.event_received.connect(self._import_event)
         self._worker_signals.succeeded.connect(self._created)
@@ -411,6 +478,7 @@ class ProjectWizard(QDialog):
         if signals is not None:
             signals.deleteLater()
         self.add_source_button.setEnabled(True)
+        self.import_problem_docx_button.setEnabled(True)
         self.add_template_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
         self._update_remove_enabled()

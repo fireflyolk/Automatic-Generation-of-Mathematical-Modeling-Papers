@@ -1,6 +1,6 @@
 # MathModel Paper Studio
 
-面向个人 Windows 电脑的数模论文工作台。当前交付的是可运行的 v7 预览版：支持项目与 CSV/XLSX 导入、Word 模板映射、Codex 本机 CLI 文本连接、DeepSeek API 和分阶段工作流界面。
+面向个人 Windows 电脑的数模论文工作台。当前交付为预览版：支持 CSV/XLSX/DOCX 数据导入、DOCX/文字版 PDF 题目导入、Word 模板映射、Codex 本机 CLI 文本连接、DeepSeek API 和分阶段工作流界面。新建项目时点击“从 DOCX/PDF 导入题目”，核对提取文字后创建项目；扫描版 PDF 暂不支持 OCR。
 
 ## 当前 Agent 接入
 

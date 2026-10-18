@@ -17,6 +17,11 @@ APP = None
 
 
 class DeepSeekSelectionTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {'DEEPSEEK_API_KEY': ''})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     @classmethod
     def setUpClass(cls):
         global APP
@@ -123,12 +128,12 @@ class DeepSeekSelectionTests(unittest.TestCase):
             self.assertEqual(status.message, view.status_label.text())
             self.assertTrue(view.codex_test_button.isEnabled())
 
-    def test_codex_settings_rejects_any_ready_status_from_connection_only_setter(self):
+    def test_codex_settings_accepts_verified_no_environment_policy_but_rejects_legacy_profile(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             view = SettingsView(AppPaths(Path(temporary) / 'app-data'))
             self.addCleanup(view.close)
             initial_status = view.selected_status
-            forged_ready_status = ProviderStatus(
+            legacy_ready_status = ProviderStatus(
                 Provider.CODEX, r'F:\codex\codex.exe', '0.159.3', True, None,
                 'synthetic ready status',
                 AdapterCapabilities(True, True, True, 'provider_transport_only',
@@ -136,10 +141,22 @@ class DeepSeekSelectionTests(unittest.TestCase):
             )
 
             with self.assertRaises(TypeError):
-                view.set_codex_probe_status(forged_ready_status)
+                view.set_codex_probe_status(legacy_ready_status)
 
             self.assertIs(view.selected_status, initial_status)
             self.assertFalse(view.selected_status.available)
+
+            verified_status = ProviderStatus(
+                Provider.CODEX, r'F:\codex\codex.exe', '0.159.3', True, None,
+                'empty execution environment verified',
+                AdapterCapabilities(True, True, True, 'provider_transport_only',
+                                    'cli_native_only', 'text_only_no_environment'), True,
+            )
+            view.set_codex_probe_status(verified_status)
+
+            self.assertIs(view.selected_status, verified_status)
+            self.assertTrue(view.selected_status.available)
+            self.assertIn('无执行环境策略已验证', view.connection_label.text())
 
 
 if __name__ == '__main__':

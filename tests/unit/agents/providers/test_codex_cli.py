@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 from mathmodel_paper_studio.agents.preflight import Provider, UnavailableReason
 from mathmodel_paper_studio.agents.protocol import EventKind
-from mathmodel_paper_studio.agents.providers.codex_cli import CodexCliAdapter, CodexEventParser
+from mathmodel_paper_studio.agents.providers.codex_cli import (
+    CODEX_DISABLED_FEATURES, CodexCliAdapter, CodexEventParser,
+)
 
 
 def wire(kind, **fields):
@@ -24,6 +26,13 @@ USAGE = {'input_tokens': 10, 'cached_input_tokens': 0, 'output_tokens': 3,
 
 
 class CodexParserTests(unittest.TestCase):
+    def test_memory_tools_are_in_the_explicitly_disabled_codex_feature_set(self):
+        required = {
+            'memories', 'agent_message_board', 'multi_agent_v2', 'guardianv2',
+            'token_budget',
+        }
+        self.assertTrue(required.issubset(CODEX_DISABLED_FEATURES))
+
     def test_exact_version_binding_and_single_turn_start(self):
         with self.assertRaises(ValueError):
             CodexEventParser('r1', version='0.159.4')

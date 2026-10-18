@@ -4,7 +4,7 @@ from datetime import date, datetime
 import math
 from pathlib import Path
 
-from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
+from mathmodel_paper_studio.bootstrap.paths import validate_import_source_path, validate_managed_path
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,11 @@ class ImportLimits:
     max_zip_total_bytes: int = 64 * 1024 * 1024
     max_zip_members: int = 2048
     max_cells: int = 1_000_000
+    max_docx_chars: int = 100_000
+    max_pdf_pages: int = 200
+    max_pdf_chars: int = 100_000
+    max_pdf_stream_bytes: int = 8 * 1024 * 1024
+    max_pdf_total_stream_bytes: int = 32 * 1024 * 1024
 
     def __post_init__(self):
         if any(type(getattr(self, f.name)) is not int or getattr(self, f.name) <= 0 for f in fields(self)):
@@ -42,6 +47,20 @@ def read_bounded(path: Path | bytes, limits: ImportLimits) -> bytes:
     path = validate_managed_path(path)
     if not path.is_file():
         raise ValueError('输入不是普通文件。')
+    if path.stat().st_size > limits.max_file_bytes:
+        raise ValueError('输入文件超过字节上限。')
+    with path.open('rb') as stream:
+        content = stream.read(limits.max_file_bytes + 1)
+    if len(content) > limits.max_file_bytes:
+        raise ValueError('输入文件超过字节上限。')
+    return content
+
+
+def read_source_bounded(path: Path, limits: ImportLimits) -> bytes:
+    """Read a user-selected F: input outside app storage without granting write scope."""
+    path = validate_import_source_path(path)
+    if not path.is_file():
+        raise ValueError('源文件不是普通文件。')
     if path.stat().st_size > limits.max_file_bytes:
         raise ValueError('输入文件超过字节上限。')
     with path.open('rb') as stream:

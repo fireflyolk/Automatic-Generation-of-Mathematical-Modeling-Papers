@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 
 from mathmodel_paper_studio.agents.preflight import Provider, ProviderStatus
+from mathmodel_paper_studio.agents.protocol import AgentEvent, EventKind
+from mathmodel_paper_studio.agents.deepseek_model_preferences import DeepSeekModelPreference
 from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
 from mathmodel_paper_studio.domain.models import ArtifactEvidence, Stage, StageStatus
 from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
@@ -27,6 +29,7 @@ from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.workflow.checkpoint import CheckpointStore
 from mathmodel_paper_studio.workflow.context_builder import ContextBuilder, ContextInputError
 from mathmodel_paper_studio.workflow.engine import WorkflowEngine
+from mathmodel_paper_studio.workflow.progress import ProgressKind
 from mathmodel_paper_studio.workflow.stages import ArtifactDigest, PauseReason, StageOutput, StageResult
 
 _MAX_JSON_BYTES = 1024 * 1024
@@ -113,7 +116,7 @@ class LiveWorkflowEngine(WorkflowEngine):
     """Nine-stage flow using trusted, injected service objects and immutable outputs.
 
     provider_client.generate(context, prompt, cancel_event=None) returns JSON text.
-    computation_runner.run accepts input_files, deterministic_seed, attempt, cancel_event.
+    computation_runner.run accepts input_files, input_hashes, deterministic_seed, attempt, cancel_event.
     A status_getter can supply the latest trusted probe result for each preflight.
     """
 
@@ -133,24 +136,37 @@ class LiveWorkflowEngine(WorkflowEngine):
         self.provider_status, self.status_getter = provider_status, status_getter
         self.template_mapping, self.deterministic_seed = template_mapping, deterministic_seed
 
-    def _drive(self, project, run_id, sources, selected_source_ids, layout, store, state, cancel_event):
+    def _drive(self, project, run_id, sources, selected_source_ids, layout, store,
+               state, cancel_event, progress=None):
         run = self.runs.get(run_id)
         provider_client = self._client_for(run.provider)
+        prepare_selected = getattr(provider_client, 'prepare_selected_scope', None)
         prepare = getattr(provider_client, 'prepare_scope', None)
-        if (run.provider is not Provider.DEEPSEEK and callable(prepare)
+        if (run.provider is not Provider.DEEPSEEK
+                and (callable(prepare) or (run.provider is Provider.CODEX and callable(prepare_selected)))
                 and not (cancel_event is not None and cancel_event.is_set())):
             try:
                 builder = ContextBuilder(project, layout.run, layout.project_root, sources,
                                          selected_source_ids=selected_source_ids)
                 readable = tuple(builder._verified_copy(source)[0] for source in builder.selected)
-                ready, _, _ = prepare(project, layout.run, readable, layout.root)
+                if run.provider is Provider.CODEX and callable(prepare_selected):
+                    ready, _, _ = prepare_selected(
+                        project, layout.run, readable, layout.root, builder.selected, cancel_event,
+                    )
+                else:
+                    ready, _, _ = prepare(project, layout.run, readable, layout.root)
                 if ready is not True:
                     raise ValueError('可信 CLI 范围检查未通过。')
             except (ValueError, OSError, TypeError, RuntimeError, ContextInputError):
                 result = self._paused(state.next_stage, state.next_attempt, PauseReason.PREFLIGHT_FAILED,
                                       '本次可信 CLI 范围检查未通过，已暂停。')
-                return self._commit_result(state, result, (), layout, store)
-        return super()._drive(project, run_id, sources, selected_source_ids, layout, store, state, cancel_event)
+                self._emit_stage_started(progress, result.stage, result.attempt)
+                state = self._commit_result(state, result, (), layout, store)
+                self._emit_stage_result(progress, result, ())
+                self._emit_run_terminal(progress, state)
+                return state
+        return super()._drive(project, run_id, sources, selected_source_ids,
+                              layout, store, state, cancel_event, progress)
 
     @staticmethod
     def _paused(stage, attempt, reason, diagnostic):
@@ -182,21 +198,50 @@ class LiveWorkflowEngine(WorkflowEngine):
         provider_evidence_ready = (
             isinstance(status, ProviderStatus) and status.evidence_verified is True
         )
+        computation_available = True
+        computation_message = '由注入的受控计算后端处理。'
+        computation_checker = getattr(self.computation_runner, 'available', None)
+        if callable(computation_checker):
+            try:
+                checked = computation_checker()
+                if (not isinstance(checked, tuple) or len(checked) != 2
+                        or type(checked[0]) is not bool or not isinstance(checked[1], str)):
+                    computation_available, computation_message = False, '受控计算后端预检响应无效。'
+                else:
+                    computation_available, computation_message = checked
+            except (OSError, RuntimeError, TypeError, ValueError):
+                computation_available, computation_message = False, '受控计算后端预检未完成。'
         if (not callable(getattr(provider_client, 'generate', None))
                 or not callable(getattr(self.computation_runner, 'run', None))
+                or not computation_available
                 or not isinstance(status, ProviderStatus) or status.provider is not context.provider
                 or status.available is not True
                 or not (provider_evidence_ready or api_key_detected)):
             return self._paused(context.stage, context.attempt, PauseReason.PREFLIGHT_FAILED,
                                 ('DeepSeek API 密钥、生成服务或受控计算服务不可用，已暂停。'
                                  if context.provider is Provider.DEEPSEEK else
-                                 '缺少本次可信 CLI 状态、生成服务或受控计算服务，已暂停。'))
-        return self._complete(context, self._output('preflight.json', {
+                                 '缺少本次可信 CLI 状态、生成服务或受控计算服务，已暂停。')
+                                + ('' if computation_available else f' {computation_message}'))
+        preflight = {
             'provider': status.provider.value, 'version': status.version,
             'trusted_probe_passed': status.evidence_verified,
             'local_api_key_detected': api_key_detected,
             'remote_connection_verified': status.evidence_verified,
-            'computation_gate': 'independently_enforced_by_runner', 'human_review_required': True}))
+            'computation_gate': 'independently_enforced_by_runner', 'human_review_required': True,
+            'computation_backend': 'windows_sandbox' if computation_checker else 'injected_test_adapter',
+            'computation_status': computation_message,
+        }
+        if context.provider is Provider.DEEPSEEK:
+            preference_getter = getattr(provider_client, 'authorized_model_preference', None)
+            preference = preference_getter(context.run_id) if callable(preference_getter) else None
+            preflight['model'] = (
+                preference.model if isinstance(preference, DeepSeekModelPreference) else status.version
+            )
+            preflight['version'] = preflight['model']
+            preflight['reasoning_effort'] = (
+                preference.effort if isinstance(preference, DeepSeekModelPreference) else None
+            )
+        return self._complete(context, self._output('preflight.json', preflight))
 
     def _layout(self, context):
         project, run = self._records(context.project_id, context.run_id)
@@ -217,7 +262,8 @@ class LiveWorkflowEngine(WorkflowEngine):
         artifact = max(matches, key=lambda item: item.delivery)
         return _json(self._artifact_content(context, artifact).decode('utf-8'))
 
-    def _request(self, context, fields, extra, cancel_event=None):
+    def _request(self, context, fields, extra, cancel_event=None, progress=None):
+        attempt = getattr(context, 'attempt', None)
         upstream = []
         for artifact in context.upstream_artifacts:
             if Path(artifact.relative_path).name not in {
@@ -263,37 +309,122 @@ class LiveWorkflowEngine(WorkflowEngine):
                     or getattr(scope, 'billable', None) is not True
                     or getattr(scope, 'tools_enabled', None) is not False):
                 raise ValueError('DeepSeek API 范围摘要无效。')
-        raw = self._client_for(getattr(context, 'provider', None)).generate(
-            context, prompt, cancel_event=cancel_event)
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError('阶段已取消。')
-        return _json(raw, fields)
+        client = self._client_for(getattr(context, 'provider', None))
+        generate_with_progress = getattr(client, 'generate_with_progress', None)
+        use_progress = progress is not None and callable(generate_with_progress)
+        self._emit_progress(progress, ProgressKind.AGENT_REQUEST_STARTED,
+                            'Agent 请求已准备', stage=context.stage, attempt=attempt)
+        terminal_kind = None
 
-    def _execute_stage(self, context, artifact_directory, cancel_event=None):
+        def on_agent_event(event):
+            nonlocal terminal_kind
+            if not isinstance(event, AgentEvent) or event.run_id != progress.run_id:
+                self._emit_progress(progress, ProgressKind.AGENT_FAILED,
+                                    'Agent 事件无法安全显示', stage=context.stage,
+                                    attempt=attempt)
+                terminal_kind = ProgressKind.AGENT_FAILED
+                return
+            if event.kind is EventKind.STARTED:
+                self._emit_progress(progress, ProgressKind.AGENT_WAITING,
+                                    'Agent 正在处理请求', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id)
+            elif event.kind is EventKind.TEXT:
+                self._emit_progress(progress, ProgressKind.AGENT_MESSAGE,
+                                    'Agent 可见消息', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id,
+                                    detail=event.text)
+            elif event.kind in (EventKind.TOOL_STARTED, EventKind.TOOL_FINISHED):
+                self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
+                                    'Agent 工具事件未获本次运行授权', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id,
+                                    detail='该动作未由本次运行执行。')
+            elif event.kind is EventKind.COMPLETED:
+                self._emit_progress(progress, ProgressKind.AGENT_COMPLETED,
+                                    'Agent 已返回响应', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id)
+                terminal_kind = ProgressKind.AGENT_COMPLETED
+            elif event.kind is EventKind.FAILED:
+                self._emit_progress(progress, ProgressKind.AGENT_FAILED,
+                                    'Agent 请求失败', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id)
+                terminal_kind = ProgressKind.AGENT_FAILED
+            elif event.kind is EventKind.CANCELLED:
+                self._emit_progress(progress, ProgressKind.AGENT_CANCELLED,
+                                    'Agent 请求已取消', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id)
+                terminal_kind = ProgressKind.AGENT_CANCELLED
+            elif event.kind is EventKind.BLOCKED:
+                self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
+                                    'Agent 操作已拦截', stage=context.stage,
+                                    attempt=attempt, item_id=event.item_id,
+                                    detail='当前运行策略不允许此动作。')
+                terminal_kind = ProgressKind.AGENT_BLOCKED
+
+        try:
+            if use_progress:
+                raw = generate_with_progress(
+                    context, prompt, cancel_event=cancel_event, event_callback=on_agent_event)
+            else:
+                self._emit_progress(progress, ProgressKind.AGENT_WAITING,
+                                    '等待 Agent 响应', stage=context.stage,
+                                    attempt=attempt)
+                raw = client.generate(context, prompt, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                if terminal_kind is not ProgressKind.AGENT_CANCELLED:
+                    self._emit_progress(progress, ProgressKind.AGENT_CANCELLED,
+                                        'Agent 请求已取消', stage=context.stage,
+                                        attempt=attempt)
+                    terminal_kind = ProgressKind.AGENT_CANCELLED
+                raise RuntimeError('阶段已取消。')
+            result = _json(raw, fields)
+            if terminal_kind is None:
+                self._emit_progress(progress, ProgressKind.AGENT_COMPLETED,
+                                    'Agent 已返回响应', stage=context.stage,
+                                    attempt=attempt)
+            return result
+        except Exception:
+            if terminal_kind is None:
+                kind = (ProgressKind.AGENT_CANCELLED if cancel_event is not None and cancel_event.is_set()
+                        else ProgressKind.AGENT_FAILED)
+                title = 'Agent 请求已取消' if kind is ProgressKind.AGENT_CANCELLED else 'Agent 请求失败'
+                self._emit_progress(progress, kind, title, stage=context.stage,
+                                    attempt=attempt)
+            raise
+
+    def _execute_stage_with_progress(self, context, artifact_directory, cancel_event, progress):
+        return self._execute_stage(context, artifact_directory, cancel_event, progress=progress)
+
+    def _execute_stage(self, context, artifact_directory, cancel_event=None, progress=None):
         try:
             if context.stage is Stage.PREFLIGHT:
                 return self._preflight(context, cancel_event)
             if context.stage is Stage.DATA_PROFILE:
-                profiles = [{'source_id': item.source_id, 'evidence_id': item.evidence_id,
-                             'sha256': item.sha256, 'profile': _json(item.profile_json)}
-                            for item in context.inputs if item.kind in ('csv', 'xlsx')]
+                profiles = []
+                for item in context.inputs:
+                    if item.kind not in ('csv', 'xlsx', 'docx_data'):
+                        continue
+                    profile = _json(item.profile_json)
+                    if item.kind == 'docx_data':
+                        profile = {key: value for key, value in profile.items() if key != 'text'}
+                    profiles.append({'source_id': item.source_id, 'evidence_id': item.evidence_id,
+                                     'sha256': item.sha256, 'profile': profile})
                 if not profiles:
                     return self._paused(context.stage, context.attempt, PauseReason.MISSING_DATA, '缺少已授权表格副本。')
                 return self._complete(context, self._output('data-profile.json', {'profiles': profiles}))
             if context.stage in (Stage.PROBLEM_DECOMPOSITION, Stage.MODEL_PROPOSAL):
-                value = self._request(context, set(_SCHEMAS[context.stage]), {}, cancel_event)
+                value = self._request(context, set(_SCHEMAS[context.stage]), {}, cancel_event, progress)
                 for collection in value.values():
                     _strings(collection)
                 name = 'decomposition.json' if context.stage is Stage.PROBLEM_DECOMPOSITION else 'model.json'
                 return self._complete(context, self._output(name, value))
             if context.stage is Stage.CODE_GENERATION:
-                return self._generate_code(context, cancel_event)
+                return self._generate_code(context, cancel_event, progress)
             if context.stage is Stage.CALCULATION:
                 return self._calculate(context, cancel_event)
             if context.stage is Stage.RESULT_VALIDATION:
                 return self._validate(context)
             if context.stage is Stage.PAPER_DRAFTING:
-                return self._paper(context, cancel_event)
+                return self._paper(context, cancel_event, progress)
             if context.stage is Stage.DOCX_QA:
                 return self._qa(context)
             raise ValueError('未知工作流阶段。')
@@ -325,8 +456,8 @@ class LiveWorkflowEngine(WorkflowEngine):
             specs.append(ArtifactExpectation(relative, kind, columns or None, item['rows']))
         return tuple(specs)
 
-    def _generate_code(self, context, cancel_event):
-        value = self._request(context, {'source', 'outputs'}, {}, cancel_event)
+    def _generate_code(self, context, cancel_event, progress=None):
+        value = self._request(context, {'source', 'outputs'}, {}, cancel_event, progress)
         source = value['source']
         if not isinstance(source, str) or not source.strip() or '\0' in source:
             raise ValueError('生成源代码无效。')
@@ -351,16 +482,22 @@ class LiveWorkflowEngine(WorkflowEngine):
         declaration = self._latest(context, Stage.CODE_GENERATION, 'code-plan.json')
         specs = self._specifications(declaration['outputs'], context.attempt)
         files = []
+        file_hashes = []
         for item in context.inputs:
-            if item.kind in ('csv', 'xlsx'):
+            if item.kind in ('csv', 'xlsx', 'docx_data'):
                 path = validate_managed_path(layout.project_root / item.relative_path)
                 _read(path, limit=32 * 1024 * 1024, digest=item.sha256)
                 files.append(path)
+                file_hashes.append(item.sha256)
         if not files:
-            return self._paused(context.stage, context.attempt, PauseReason.MISSING_DATA, '缺少计算输入。')
+            return self._paused(
+                context.stage, context.attempt, PauseReason.MISSING_DATA,
+                '缺少已选择的计算输入；请至少选择一个 CSV、XLSX 或 DOCX 数据附件。',
+            )
         outcome = self.computation_runner.run(layout, source, input_files=tuple(files),
                                               deterministic_seed=self.deterministic_seed, attempt=context.attempt,
-                                              cancel_event=cancel_event)
+                                              cancel_event=cancel_event, expected_outputs=specs,
+                                              input_hashes=tuple(file_hashes))
         if outcome.stage_status is StageStatus.CANCELLED:
             return StageResult(context.stage, context.attempt, StageStatus.CANCELLED, diagnostic='计算服务已取消。')
         evidence = tuple(item for item in (outcome.script_evidence, outcome.summary_evidence,
@@ -372,8 +509,13 @@ class LiveWorkflowEngine(WorkflowEngine):
                     'human_review_required': True, 'mathematical_correctness_verified': False}
         output = self._output('calculation.json', manifest)
         if outcome.stage_status is StageStatus.PAUSED:
+            diagnostic = ('受控 Python 隔离尚未通过预检，生成代码未执行；已暂停且没有继续起草。'
+                          if outcome.execution_started is not True else
+                          '沙盒计算未完成或输出校验失败；已暂停且没有继续起草。')
+            pause_reason = (PauseReason.VALIDATION_FAILED if outcome.execution_started is True
+                            else PauseReason.ADAPTER_UNAVAILABLE)
             return StageResult(context.stage, context.attempt, StageStatus.PAUSED, (output,),
-                               '可信计算边界尚未就绪，已暂停且没有继续起草。', PauseReason.ADAPTER_UNAVAILABLE)
+                               diagnostic, pause_reason)
         if outcome.stage_status is not StageStatus.COMPLETED or outcome.execution_started is not True:
             return StageResult(context.stage, context.attempt, StageStatus.FAILED, (output,), '受控计算未成功完成。')
         allowed = {spec.relative_path for spec in specs}
@@ -438,7 +580,7 @@ class LiveWorkflowEngine(WorkflowEngine):
             rows.append(tuple(row))
         return headers, tuple(rows)
 
-    def _paper(self, context, cancel_event):
+    def _paper(self, context, cancel_event, progress=None):
         template = self._template(context)
         if template is None:
             return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
@@ -454,7 +596,8 @@ class LiveWorkflowEngine(WorkflowEngine):
             extras.append(entry)
         value = self._request(context, {'sections', 'tables', 'figures'}, {
             'validated_evidence': extras, 'confirmed_mapping': self.template_mapping.to_dict(),
-            'reference_policy': 'No verified bibliographic sources supplied; do not cite or invent any.'}, cancel_event)
+            'reference_policy': 'No verified bibliographic sources supplied; do not cite or invent any.'},
+            cancel_event, progress)
         draft = self._paper_draft(context, value, evidence)
         layout = self._layout(context)
         directory = layout.path_for('60_paper')
@@ -596,6 +739,4 @@ class LiveWorkflowEngine(WorkflowEngine):
         if len({item.relative_path for item in digests}) != len(digests):
             raise ValueError('计算服务重复登记工件。')
         return super()._write_outputs(layout, directory, state, result, delivery) + digests
-
-
 

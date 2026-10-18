@@ -9,7 +9,7 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, QUrl, QThreadPool, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
+    QDialog, QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QMessageBox,
     QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
@@ -18,19 +18,41 @@ from qfluentwidgets import (
     SubtitleLabel, Theme, TitleLabel, MessageBox, qconfig, setCustomStyleSheet,
 )
 
-from mathmodel_paper_studio.agents.preflight import Provider, ProviderStatus
+from mathmodel_paper_studio.agents.preflight import (
+    AdapterCapabilities, Provider, ProviderStatus, UnavailableReason,
+)
+from mathmodel_paper_studio.agents.codex_model_preferences import (
+    CodexModelPreferenceError,
+    CodexModelPreferenceStore,
+)
+from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    DEFAULT_DEEPSEEK_EFFORT,
+    DEFAULT_DEEPSEEK_MODEL,
+    DeepSeekModelPreference,
+    DeepSeekModelPreferenceError,
+    DeepSeekModelPreferenceStore,
+)
 from mathmodel_paper_studio.agents.providers.deepseek_api import DeepSeekApiClient
-from mathmodel_paper_studio.agents.live_runtime import LiveProviderService
+from mathmodel_paper_studio.agents.codex_text_service import CodexTextService
 from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_path
 from mathmodel_paper_studio.domain.models import Run, RunStatus, SourceFile
+from mathmodel_paper_studio.inputs.import_service import MAX_PROBLEM_TEXT_BYTES
 from mathmodel_paper_studio.execution.python_runner import PythonRunner
+from mathmodel_paper_studio.execution.windows_sandbox import (
+    WindowsSandboxExecutor,
+    resolve_computation_runtime_root,
+)
 from mathmodel_paper_studio.paper.docx_qa import DocxQaReport, run_docx_qa
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
+from mathmodel_paper_studio.projects.manifest import latest_manifest
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.storage.database import Database
 from mathmodel_paper_studio.storage.repositories import ProjectRepository, RunRepository
 from mathmodel_paper_studio.ui.project_wizard import ProjectWizard
+from mathmodel_paper_studio.ui.project_editor import ProjectEditorDialog
+from mathmodel_paper_studio.ui.codex_model_dialog import CodexModelDialog
+from mathmodel_paper_studio.ui.deepseek_model_dialog import DeepSeekModelDialog
 from mathmodel_paper_studio.ui.run_panel import RunPanel
 from mathmodel_paper_studio.ui.run_review import RunReviewDialog, RunReviewModel
 from mathmodel_paper_studio.ui.settings_view import SettingsView
@@ -38,9 +60,9 @@ from mathmodel_paper_studio.ui.template_mapping_view import TemplateMappingView
 from mathmodel_paper_studio.ui.workers import FunctionWorker
 from mathmodel_paper_studio.workflow.live_engine import LiveWorkflowEngine
 from mathmodel_paper_studio.workflow.provider_clients import ProviderClientRegistry
+from mathmodel_paper_studio.workflow.progress import ProgressKind
 from mathmodel_paper_studio.workflow.stages import WORKFLOW_STAGES
 
-_MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_PROFILE_BYTES = 1024 * 1024
 _MAX_SOURCE_BYTES = 64 * 1024 * 1024
 _STATUS_SYSTEM_COLORS = {
@@ -123,32 +145,56 @@ class MainWindow(FluentWindow):
         self.projects = project_repository or ProjectRepository(self.database)
         self.runs = run_repository or RunRepository(self.database)
         self.project_service = project_service or ProjectService(paths, self.projects)
+        self.deepseek_model_preferences = DeepSeekModelPreferenceStore(paths)
         codex_runtime = None
         if workflow_engine is None:
-            codex_runtime = LiveProviderService(paths)
+            codex_runtime = CodexTextService(paths)
             provider_clients = ProviderClientRegistry({
                 Provider.CODEX: codex_runtime,
-                Provider.DEEPSEEK: DeepSeekApiClient(),
+                Provider.DEEPSEEK: DeepSeekApiClient(
+                    preference_resolver=self.deepseek_model_preferences.load,
+                ),
             })
             workflow_engine = LiveWorkflowEngine(
                 paths, self.projects, self.runs, provider_client=provider_clients,
-                computation_runner=PythonRunner(),
+                computation_runner=PythonRunner(executor=WindowsSandboxExecutor(
+                    resolve_computation_runtime_root(),
+                )),
             )
         self.workflow = workflow_engine
         self.scope_verifier = scope_verifier
-        self.codex_probe = codex_probe or codex_runtime
+        self.codex_model_preferences = CodexModelPreferenceStore(paths)
+        self.deepseek_model_service = self._provider_client(Provider.DEEPSEEK)
+        if not callable(getattr(self.deepseek_model_service, 'list_models', None)):
+            self.deepseek_model_service = DeepSeekApiClient(
+                preference_resolver=self.deepseek_model_preferences.load,
+            )
+        self.codex_model_service = codex_runtime or self._provider_client(Provider.CODEX)
+        if not callable(getattr(self.codex_model_service, 'list_models', None)):
+            self.codex_model_service = CodexTextService(paths)
+        self.codex_probe = codex_probe or codex_runtime or self._provider_client(Provider.CODEX)
         self._codex_probe_generation = 0
         self._codex_probe_workers = {}
+        self._codex_model_workers = {}
+        self._codex_model_dialogs = set()
+        self._deepseek_model_workers = {}
+        self._deepseek_model_dialogs = set()
         self._window_closing = False
         self._project = None
         self._sources = ()
+        self._source_revision = None
         self._project_load_generation = 0
         self._project_load_workers = {}
         self._artifact_review_generation = 0
         self._artifact_review_workers = {}
+        self._artifact_review_evidence_by_token = {}
+        self._artifact_review_context_by_token = {}
         self._run_review_generation = 0
         self._run_review_workers = {}
         self._run_review_pending = False
+        self._project_delete_generation = 0
+        self._project_delete_workers = {}
+        self._run_controls_locked_project_id = None
         self._active_run = None
         self._deepseek_consent_run_id = None
         self._review_dialog = None
@@ -162,11 +208,20 @@ class MainWindow(FluentWindow):
         self.new_project_button.setIcon(FluentIcon.FOLDER_ADD)
         self.new_project_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.new_project_button.setAccessibleName('新建项目')
+        self.delete_project_button = PushButton('删除选中项目')
+        self.delete_project_button.setObjectName('deleteSelectedProject')
+        self.delete_project_button.setAccessibleName('删除选中的项目及其导入材料和运行产物')
+        self.delete_project_button.setEnabled(False)
+        self.delete_project_button.setToolTip('先选择要删除的项目。')
         self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.project_page = self._build_project_page()
         self.template_view = TemplateMappingView(thread_pool=self.thread_pool)
         self.run_panel = RunPanel(thread_pool=self.thread_pool)
-        self.settings_view = SettingsView(paths, provider_statuses)
+        self.settings_view = SettingsView(
+            paths, provider_statuses,
+            codex_model_preferences=self.codex_model_preferences,
+            deepseek_model_preferences=self.deepseek_model_preferences,
+        )
         destinations = (
             (self.project_page, 'projectPage', FluentIcon.FOLDER, '项目与数据'),
             (self.template_view, 'templatePage', FluentIcon.DOCUMENT, 'Word 模板'),
@@ -180,14 +235,21 @@ class MainWindow(FluentWindow):
         self.workspace = _WorkspaceNavigation(self, tuple(page for page, *_ in destinations))
         self.project_list.itemSelectionChanged.connect(self._select_project)
         self.new_project_button.clicked.connect(self._new_project)
+        self.delete_project_button.clicked.connect(self._delete_selected_project)
         self.template_view.project_creation_requested.connect(self._new_project)
         self.run_button.clicked.connect(self._review_run)
+        self.edit_project_button.clicked.connect(self._edit_project)
         self.open_word_button.clicked.connect(self._open_selected_word)
         self.settings_view.provider_changed.connect(self._provider_changed)
         self.settings_view.codex_connection_test_requested.connect(self._start_codex_probe)
+        self.settings_view.codex_model_settings_requested.connect(self._open_codex_model_settings)
+        self.settings_view.deepseek_model_settings_requested.connect(
+            self._open_deepseek_model_settings,
+        )
         self.run_panel.artifact_access_requested.connect(self._show_artifact_review)
         self.run_panel.operation_succeeded.connect(self._run_succeeded)
         self.run_panel.operation_failed.connect(self._run_failed)
+        self.run_panel.state_changed.connect(self._run_state_changed)
         self.run_panel.resume_requested.connect(self._resume_run)
         self.run_panel.cancel_requested.connect(self._cancel_paused_run)
         self._provider_changed(self.settings_view.selected_status)
@@ -223,6 +285,7 @@ class MainWindow(FluentWindow):
         selector.addWidget(BodyLabel('项目列表', page))
         selector.addWidget(self.new_project_button)
         selector.addWidget(self.project_list, 1)
+        selector.addWidget(self.delete_project_button)
         columns.addLayout(selector, 0)
 
         self.project_details_scroll = QScrollArea(page)
@@ -251,6 +314,11 @@ class MainWindow(FluentWindow):
         self.problem_card = CardWidget(details)
         problem_layout = QVBoxLayout(self.problem_card)
         problem_layout.addWidget(TitleLabel('题目与数据摘要', self.problem_card))
+        self.edit_project_button = PushButton('编辑题目与数据', self.problem_card)
+        self.edit_project_button.setObjectName('editProjectInputs')
+        self.edit_project_button.setAccessibleName('编辑当前项目题目文本和数据文件')
+        self.edit_project_button.setEnabled(False)
+        problem_layout.addWidget(self.edit_project_button)
         problem_layout.addWidget(CaptionLabel('竞赛题目文本', self.problem_card))
         self.problem_view = QPlainTextEdit(self.problem_card)
         self.problem_view.setAccessibleName('当前项目题目文本')
@@ -333,6 +401,7 @@ class MainWindow(FluentWindow):
         self.artifact_card.setVisible(has_project)
         self.run_button.setVisible(has_project)
         self.open_word_button.setVisible(has_project)
+        self.edit_project_button.setVisible(has_project)
 
     def _load_projects(self):
         current_id = self._project.project_id if self._project is not None else None
@@ -350,13 +419,16 @@ class MainWindow(FluentWindow):
         elif self.project_list.count() == 0:
             self._project = None
             self._sources = ()
+            self._source_revision = None
             _set_feedback(self.selected_project_label, '尚未选择项目', 'neutral')
             self.problem_view.clear()
             self.source_list.clear()
             self.data_summary.clear()
             self.run_button.setEnabled(False)
             self.open_word_button.setEnabled(False)
+            self.edit_project_button.setEnabled(False)
             self._set_project_page_state(False)
+        self._refresh_delete_project_button()
 
     def _new_project(self):
         wizard = ProjectWizard(self.project_service, self, thread_pool=self.thread_pool)
@@ -381,6 +453,7 @@ class MainWindow(FluentWindow):
         token = self._project_load_generation
         self._project = project
         self._sources = ()
+        self._source_revision = None
         self._set_project_page_state(True)
         _set_feedback(self.selected_project_label, f'活动项目：{project.title} · 正在后台读取', 'loading')
         self.problem_view.clear()
@@ -390,6 +463,7 @@ class MainWindow(FluentWindow):
         self.data_summary.setPlainText('\u6b63\u5728 F: \u540e\u53f0\u6821\u9a8c\u8f93\u5165\u6e05\u5355\u548c\u6587\u4ef6\u54c8\u5e0c\u2026')
         self.run_button.setEnabled(False)
         self.open_word_button.setEnabled(False)
+        self.edit_project_button.setEnabled(False)
         project_root = self.paths.root / project.relative_path
         worker = FunctionWorker(lambda cancel, emit: self._read_project_snapshot(
             project.project_id, project_root, cancel, emit))
@@ -399,20 +473,24 @@ class MainWindow(FluentWindow):
         signals.failed.connect(lambda message, token=token: self._project_load_failed(token, message))
         signals.finished.connect(lambda token=token: self._project_load_finished(token))
         self.thread_pool.start(worker)
+        self._refresh_delete_project_button()
         self.project_selected.emit(project)
 
     def _project_load_succeeded(self, token, snapshot):
         if token != self._project_load_generation:
             return
-        project_root, sources, problem, summary = snapshot
+        project_root, sources, problem, summary, revision = snapshot
         try:
             self.template_view.set_project_root(project_root)
             self._sources = sources
+            self._source_revision = revision
             self.source_list.blockSignals(True)
             self.source_list.clear()
             for source in sources:
                 file_path = project_root / source.relative_path
-                item = QListWidgetItem(f'{source.kind.upper()}  {source.relative_path}')
+                kind_label = {'docx_data': 'DOCX 数据', 'docx': 'Word 模板'}.get(
+                    source.kind, source.kind.upper())
+                item = QListWidgetItem(f'{kind_label}  {source.relative_path}')
                 item.setData(Qt.ItemDataRole.UserRole, source.source_id)
                 item.setData(Qt.ItemDataRole.UserRole + 1, str(file_path))
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -426,7 +504,8 @@ class MainWindow(FluentWindow):
             templates = [item for item in sources if item.kind == 'docx']
             if templates:
                 self.template_view.set_template_path(project_root / templates[0].relative_path)
-            self.run_button.setEnabled(bool(sources) and not self._run_review_pending)
+            self._set_run_enabled(bool(sources) and not self._run_review_pending)
+            self._refresh_edit_project_button()
         except (OSError, ValueError, TypeError) as exc:
             self._project_load_failed(token, str(exc))
         finally:
@@ -436,7 +515,9 @@ class MainWindow(FluentWindow):
         if token != self._project_load_generation:
             return
         self._sources = ()
+        self._source_revision = None
         self.run_button.setEnabled(False)
+        self.edit_project_button.setEnabled(False)
         self.data_summary.setPlainText(f'\u8f93\u5165\u6e05\u5355\u65e0\u6cd5\u9a8c\u8bc1\uff1a{str(message)[:1000]}')
         if self._project is not None:
             _set_feedback(self.selected_project_label, f'{self._project.title} \uff08\u8f93\u5165\u68c0\u67e5\u5931\u8d25\uff09', 'error')
@@ -446,6 +527,178 @@ class MainWindow(FluentWindow):
         if entry is not None:
             _worker, signals = entry
             signals.deleteLater()
+        self._refresh_delete_project_button()
+
+    def _delete_selected_project(self):
+        items = self.project_list.selectedItems()
+        if not items:
+            return
+        project_id = items[0].data(Qt.ItemDataRole.UserRole)
+        project = self.projects.get(project_id)
+        if project is None:
+            self._show_error('项目记录已不存在，请刷新列表后重试。')
+            self._load_projects()
+            return
+        if self._project_delete_block_reason(project_id):
+            self._show_error(self._project_delete_block_reason(project_id))
+            self._refresh_delete_project_button()
+            return
+
+        if not self._confirm_project_deletion(project):
+            return
+
+        self._project_delete_generation += 1
+        token = self._project_delete_generation
+        worker = FunctionWorker(lambda _cancel, _emit: self.project_service.delete(project_id))
+        signals = worker.signals
+        self._project_delete_workers[token] = (worker, signals, project_id)
+        signals.succeeded.connect(
+            lambda deleted, token=token: self._project_delete_succeeded(token, deleted),
+        )
+        signals.failed.connect(
+            lambda message, token=token: self._project_delete_failed(token, message),
+        )
+        signals.finished.connect(lambda token=token: self._project_delete_finished(token))
+        self.delete_project_button.setText('正在删除项目…')
+        self.project_list.setEnabled(False)
+        self.new_project_button.setEnabled(False)
+        if self._project is not None and self._project.project_id == project_id:
+            self._set_run_enabled(False)
+            self.edit_project_button.setEnabled(False)
+        if self._active_run is not None and self._active_run.project_id == project_id:
+            self._run_controls_locked_project_id = project_id
+            self.run_panel.set_run_controls_locked(True)
+        self.thread_pool.start(worker)
+        self._refresh_delete_project_button()
+
+    def _confirm_project_deletion(self, project):
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle('确认删除项目')
+        confirmation.setText(f'确定永久删除项目“{project.title}”吗？')
+        confirmation.setInformativeText(
+            '这会删除应用数据目录中的项目副本，包括导入的题目和数据、运行记录及生成产物。'
+            '项目目录外的原始选中文件会保留；位于项目目录内的文件会随目录删除。此操作无法撤销。',
+        )
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        confirmation.button(QMessageBox.StandardButton.Yes).setText('删除项目')
+        confirmation.button(QMessageBox.StandardButton.No).setText('取消')
+        confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+        return confirmation.exec() == QMessageBox.StandardButton.Yes
+
+    def _project_delete_block_reason(self, project_id):
+        if self._project_delete_workers:
+            return '另一个项目正在删除，请等待完成后重试。'
+        if (self._active_run is not None and self._active_run.project_id == project_id
+                and (self.run_panel.active_worker is not None
+                     or self.run_panel.current_status in
+                     (RunStatus.CREATED, RunStatus.RUNNING))):
+            return '该项目仍有任务正在启动或运行；请先结束或取消运行后再删除。'
+        if (self._project_load_workers or self._run_review_workers
+                or self._artifact_review_workers or self._run_review_pending):
+            return '该项目正在读取或检查，请等待操作完成后再删除。'
+        return ''
+
+    def _project_is_being_deleted(self, project_id):
+        return any(entry[2] == project_id for entry in self._project_delete_workers.values())
+
+    def _set_run_enabled(self, enabled):
+        if (self._project is not None
+                and self._project_is_being_deleted(self._project.project_id)):
+            enabled = False
+        self.run_button.setEnabled(bool(enabled))
+
+    def _refresh_delete_project_button(self):
+        if not hasattr(self, 'delete_project_button'):
+            return
+        items = self.project_list.selectedItems()
+        if not items:
+            self.delete_project_button.setEnabled(False)
+            self.delete_project_button.setToolTip('先选择要删除的项目。')
+            return
+        project_id = items[0].data(Qt.ItemDataRole.UserRole)
+        reason = self._project_delete_block_reason(project_id)
+        exists = self.projects.get(project_id) is not None
+        self.delete_project_button.setEnabled(exists and not reason)
+        self.delete_project_button.setToolTip(reason or '删除所选项目及应用目录中的副本。')
+
+    def _project_delete_succeeded(self, token, deleted):
+        if token != self._project_delete_generation or deleted is None:
+            return
+        self._clear_deleted_project_state(deleted.project_id)
+        self.delete_project_button.setText('删除选中项目')
+        self._load_projects()
+
+    def _project_delete_failed(self, token, message):
+        if token != self._project_delete_generation:
+            return
+        entry = self._project_delete_workers.get(token)
+        project_id = entry[2] if entry is not None else None
+        if project_id is not None:
+            try:
+                record_exists = self.projects.get(project_id) is not None
+            except Exception as lookup_error:
+                self.delete_project_button.setText('删除选中项目')
+                self._show_error(
+                    f'删除操作返回错误，且无法确认项目记录状态：{str(lookup_error)[:500]}；'
+                    f'原错误：{str(message)[:500]}',
+                )
+                return
+            if not record_exists:
+                self._clear_deleted_project_state(project_id)
+                self.delete_project_button.setText('删除选中项目')
+                self._load_projects()
+                self._show_error(
+                    f'项目已从列表删除，但临时文件清理失败。请检查残留目录：{str(message)[:1000]}',
+                )
+                return
+        self.delete_project_button.setText('删除选中项目')
+        self._load_projects()
+        self._show_error(f'删除项目失败：{str(message)[:1000]}')
+
+    def _clear_deleted_project_state(self, project_id):
+        if self._project is None or self._project.project_id != project_id:
+            return
+        self._project = None
+        self._sources = ()
+        self._source_revision = None
+        self.problem_view.clear()
+        self.source_list.clear()
+        self.data_summary.clear()
+        self.artifact_list.clear()
+        self.open_word_button.setEnabled(False)
+        self.open_word_button.setProperty('paperPath', '')
+        self.edit_project_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self._set_project_page_state(False)
+        _set_feedback(self.selected_project_label, '尚未选择项目', 'neutral')
+        run_belongs_to_project = (
+            self._active_run is not None and self._active_run.project_id == project_id
+        )
+        if run_belongs_to_project:
+            self._active_run = None
+            self.run_panel.set_run_id('')
+            self.run_panel.stage_list.clear()
+            self.run_panel.event_view.clear()
+            self.run_panel.set_run_state(RunStatus.CANCELLED, '关联项目已删除。')
+
+    def _project_delete_finished(self, token):
+        entry = self._project_delete_workers.pop(token, None)
+        if entry is not None:
+            _worker, signals, project_id = entry
+            signals.deleteLater()
+            if self._run_controls_locked_project_id == project_id:
+                self.run_panel.set_run_controls_locked(False)
+                self._run_controls_locked_project_id = None
+        self.project_list.setEnabled(True)
+        self.new_project_button.setEnabled(True)
+        self.delete_project_button.setText('删除选中项目')
+        self._set_run_enabled(self._project is not None and bool(self._sources)
+                              and not self._run_review_pending)
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
 
     def _read_project_snapshot(self, project_id, project_root, cancel_event, emit_event):
         project_root = validate_managed_path(project_root)
@@ -458,19 +711,21 @@ class MainWindow(FluentWindow):
         problem_source = next((item for item in sources if item.kind == 'problem'), None)
         if problem_source is None:
             raise ValueError('\u9879\u76ee\u7f3a\u5c11\u9898\u76ee\u6587\u672c\u8f93\u5165\u3002')
-        problem = self._read_small_text(project_root / problem_source.relative_path, 1024 * 1024)
+        problem = self._read_small_text(
+            project_root / problem_source.relative_path, MAX_PROBLEM_TEXT_BYTES)
         summary = self._load_data_summary(project_root, cancel_event=cancel_event)
-        return project_root, sources, problem, summary
+        revisions = set()
+        for source in sources:
+            match = re.search(r'(?:problem|source-[0-9]{4})-v([0-9]{4})\.', source.relative_path)
+            if match is not None:
+                revisions.add(int(match.group(1)))
+        if len(revisions) != 1:
+            raise ValueError('项目输入版本不一致，请重新读取项目。')
+        return project_root, sources, problem, summary, revisions.pop()
 
     def _load_sources(self, project_id: str, project_root: Path, *, cancel_event=None,
                       emit_event=None) -> tuple[SourceFile, ...]:
-        manifest = validate_managed_path(project_root / '00_inputs' / 'manifest-v0001.json')
-        if not manifest.is_relative_to(project_root) or not manifest.is_file() or manifest.stat().st_size > _MAX_MANIFEST_BYTES:
-            raise ValueError('\u9879\u76ee\u8f93\u5165\u6e05\u5355\u7f3a\u5931\u6216\u8d85\u8fc7 1 MiB \u4e0a\u9650\u3002')
-        value = json.loads(manifest.read_text(encoding='utf-8'))
-        if (not isinstance(value, dict) or value.get('version') != 1
-                or not isinstance(value.get('sources'), list) or len(value['sources']) > 33):
-            raise ValueError('\u9879\u76ee\u8f93\u5165\u6e05\u5355\u7ed3\u6784\u65e0\u6548\u3002')
+        _revision, _manifest, value = latest_manifest(project_root)
         records = []
         for index, item in enumerate(value['sources'], start=1):
             self._raise_if_cancelled(cancel_event)
@@ -514,12 +769,25 @@ class MainWindow(FluentWindow):
     @staticmethod
     def _load_data_summary(project_root: Path, cancel_event=None) -> str:
         summaries = []
+        revision, _manifest_path, manifest = latest_manifest(project_root)
         analysis = validate_managed_path(project_root / '10_analysis')
         if not analysis.is_dir():
             return '当前项目没有数据摘要。'
-        for path in sorted(analysis.glob('source-*-profile.json')):
+        profile_names = []
+        version_suffix = '' if revision == 1 else f'-v{revision:04d}'
+        for item in manifest['sources']:
+            record = item.get('record') if isinstance(item, dict) else None
+            if not isinstance(record, dict) or record.get('kind') not in ('csv', 'xlsx', 'docx_data'):
+                continue
+            source = SourceFile(**record)
+            match = re.fullmatch(r'00_inputs/source-([0-9]{4})-v([0-9]{4})\.[a-z0-9]+',
+                                 source.relative_path)
+            if match is None or int(match.group(2)) != revision:
+                raise ValueError('当前数据摘要与输入版本不匹配。')
+            profile_names.append(f'source-{match.group(1)}{version_suffix}-profile.json')
+        for name in profile_names:
             MainWindow._raise_if_cancelled(cancel_event)
-            path = validate_managed_path(path)
+            path = validate_managed_path(analysis / name)
             if not path.is_relative_to(project_root):
                 raise ValueError('\u6570\u636e\u6458\u8981\u8d85\u51fa\u9879\u76ee\u76ee\u5f55\u3002')
             if not path.is_file() or path.stat().st_size > _MAX_PROFILE_BYTES:
@@ -527,12 +795,55 @@ class MainWindow(FluentWindow):
             value = json.loads(path.read_text(encoding='utf-8'))
             if not isinstance(value, dict):
                 raise ValueError('数据摘要格式无效。')
-            summaries.append(f"{path.name}：{value.get('row_count', '?')} 行，{len(value.get('columns', []))} 列")
+            if value.get('kind') == 'docx_data':
+                summaries.append(
+                    f"{path.name}：DOCX，{value.get('paragraph_count', '?')} 段文字，"
+                    f"{value.get('table_count', '?')} 个表格，{value.get('character_count', '?')} 字符"
+                )
+            else:
+                summaries.append(f"{path.name}：{value.get('row_count', '?')} 行，{len(value.get('columns', []))} 列")
         return '\n'.join(summaries) if summaries else '已导入数据；尚无表格摘要。'
 
+    def _can_edit_project(self) -> bool:
+        if (self._project is None or not self._sources or self._source_revision is None
+                or self._run_review_pending
+                or self._project_is_being_deleted(self._project.project_id)):
+            return False
+        list_runs = getattr(self.runs, 'list_for_project', None)
+        if not callable(list_runs):
+            return True
+        try:
+            return not any(run.status in (RunStatus.CREATED, RunStatus.RUNNING, RunStatus.PAUSED)
+                           for run in list_runs(self._project.project_id))
+        except Exception:
+            return False
+
+    def _refresh_edit_project_button(self):
+        if hasattr(self, 'edit_project_button'):
+            self.edit_project_button.setEnabled(self._can_edit_project())
+
+    def _edit_project(self):
+        if not self._can_edit_project():
+            self._refresh_edit_project_button()
+            self._show_error('当前项目尚未完成输入校验，或有等待、运行中、暂停的运行记录；请先结束该运行后再编辑。')
+            return
+        project_root = self.paths.root / self._project.relative_path
+        try:
+            problem_source = next(item for item in self._sources if item.kind == 'problem')
+            problem = self._read_small_text(
+                project_root / problem_source.relative_path, MAX_PROBLEM_TEXT_BYTES)
+            dialog = ProjectEditorDialog(
+                self.project_service, self._project, project_root, self._sources, problem,
+                revision=self._source_revision, thread_pool=self.thread_pool, parent=self,
+            )
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._select_project()
+        except (OSError, StopIteration, TypeError, ValueError) as exc:
+            self._show_error(f'无法打开项目编辑器：{str(exc)[:1000]}')
+
     def _selection_changed(self, *_):
-        self.run_button.setEnabled(self._project is not None and bool(self._sources)
-                                   and not self._run_review_pending)
+        self._set_run_enabled(self._project is not None and bool(self._sources)
+                              and not self._run_review_pending)
 
     def _selected_sources(self):
         selected_ids = []
@@ -550,13 +861,29 @@ class MainWindow(FluentWindow):
         return tuple(readable), tuple(selected_ids)
 
     def _review_run(self):
-        if self._project is None or self._run_review_pending:
+        if (self._project is None or self._run_review_pending
+                or self._project_is_being_deleted(self._project.project_id)):
             return
         readable, selected_ids = self._selected_sources()
         if not readable or not selected_ids:
             self._show_error('\u8bf7\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u53ef\u8bfb\u8f93\u5165\u6587\u4ef6\u3002')
             return
         provider_status = self.settings_view.selected_status
+        deepseek_model_preference = None
+        if provider_status.provider is Provider.DEEPSEEK:
+            try:
+                deepseek_model_preference = self.deepseek_model_preferences.load()
+                if deepseek_model_preference is None:
+                    deepseek_model_preference = DeepSeekModelPreference(
+                        DEFAULT_DEEPSEEK_MODEL, DEFAULT_DEEPSEEK_EFFORT,
+                    )
+            except DeepSeekModelPreferenceError:
+                provider_status = ProviderStatus(
+                    Provider.DEEPSEEK, None, None, False,
+                    UnavailableReason.EVIDENCE_UNVERIFIED,
+                    'DeepSeek 模型设置文件无效；本次运行已阻止。',
+                    DeepSeekApiClient.capabilities(), False,
+                )
         run_id = uuid4().hex
         run = Run(run_id, self._project.project_id, provider_status.provider,
                   RunStatus.CREATED, f'90_runs/{run_id}')
@@ -565,15 +892,21 @@ class MainWindow(FluentWindow):
         token = self._run_review_generation
         self._run_review_pending = True
         self.run_button.setEnabled(False)
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
         _set_feedback(self.qa_summary, '\u6b63\u5728\u540e\u53f0\u68c0\u67e5\u672c\u6b21\u6587\u4ef6\u8303\u56f4\u2026', 'loading')
+        selected = set(selected_ids)
+        selected_sources = tuple(source for source in self._sources if source.source_id in selected)
         worker = FunctionWorker(lambda cancel, emit: self._prepare_run_review(
-            project, run, readable, selected_ids, provider_status, cancel, emit))
+            project, run, readable, selected_ids, provider_status, cancel, emit,
+            selected_sources, deepseek_model_preference))
         signals = worker.signals
         self._run_review_workers[token] = (worker, signals)
         signals.succeeded.connect(lambda result, token=token: self._run_review_ready(token, result))
         signals.failed.connect(lambda message, token=token: self._run_review_failed(token, message))
         signals.finished.connect(lambda token=token: self._run_review_finished(token))
         self.thread_pool.start(worker)
+        self._refresh_delete_project_button()
 
     def _verify_deepseek_scope(self, project, run, readable, planned_output):
         try:
@@ -597,28 +930,84 @@ class MainWindow(FluentWindow):
         ), ()
 
     def _prepare_run_review(self, project, run, readable, selected_ids, provider_status,
-                            cancel_event, emit_event):
+                            cancel_event, emit_event, selected_sources=(),
+                            deepseek_model_preference=None):
         self._raise_if_cancelled(cancel_event)
         project_root = validate_managed_path(self.paths.root / project.relative_path)
         planned_output = validate_managed_path(project_root / run.relative_path)
+        review_status = provider_status
         scope_verified = False
         scope_message = '\u5c1a\u672a\u5b8c\u6210\u672c\u6b21\u53ef\u4fe1\u9694\u79bb\u4e0e\u6587\u4ef6\u8303\u56f4\u9884\u68c0\u3002'
         scope_errors = ()
         scope_verifier = self.scope_verifier
-        if scope_verifier is None and run.provider is Provider.DEEPSEEK:
-            scope_verifier = self._verify_deepseek_scope
-        if scope_verifier is not None:
+        codex_scope_verifier = None
+        if run.provider is Provider.CODEX:
+            probe = getattr(self.codex_probe, 'probe', None)
             try:
-                verified = scope_verifier(project, run, readable, planned_output)
-                if not isinstance(verified, (tuple, list)) or len(verified) != 3:
-                    raise ValueError('\u8303\u56f4\u68c0\u67e5\u7ed3\u679c\u683c\u5f0f\u65e0\u6548\u3002')
-                scope_verified, scope_message, scope_errors = verified
-            except Exception as exc:
-                scope_errors = (f'\u8303\u56f4\u9a8c\u8bc1\u5931\u8d25\uff1a{str(exc)[:500]}',)
+                if not callable(probe):
+                    raise RuntimeError('Codex 本机策略探测接口不可用。')
+                fresh_status = probe(Provider.CODEX, cancel_event=cancel_event)
+                if (not isinstance(fresh_status, ProviderStatus)
+                        or fresh_status.provider is not Provider.CODEX):
+                    raise RuntimeError('Codex 本机策略探测未返回可信状态。')
+                review_status = fresh_status
+            except Exception:
+                self._raise_if_cancelled(cancel_event)
+                review_status = ProviderStatus(
+                    Provider.CODEX, None, None, False, UnavailableReason.EVIDENCE_UNVERIFIED,
+                    '本次 Codex 本机策略预检未完成，自动运行保持关闭。',
+                    AdapterCapabilities(), False,
+                )
+            codex_scope_verifier = getattr(self.codex_probe, 'prepare_selected_scope', None)
+        elif scope_verifier is None and run.provider is Provider.DEEPSEEK:
+            scope_verifier = self._verify_deepseek_scope
+
+        checks = []
+        if run.provider is Provider.CODEX:
+            if scope_verifier is not None:
+                checks.append(scope_verifier)
+            if callable(codex_scope_verifier):
+                checks.append(lambda p, r, inputs, output: codex_scope_verifier(
+                    p, r, inputs, output, selected_sources, cancel_event=cancel_event))
+            if not checks:
+                scope_message = 'Codex 本次所选文件未通过受控范围登记；自动运行保持关闭。'
+                scope_errors = ('缺少 Codex 所选范围验证器。',)
+        elif scope_verifier is not None:
+            checks.append(scope_verifier)
+
+        if checks:
+            check_messages = []
+            check_errors = []
+            check_results = []
+            for check in checks:
+                try:
+                    verified = check(project, run, readable, planned_output)
+                    if not isinstance(verified, (tuple, list)) or len(verified) != 3:
+                        raise ValueError('范围检查结果格式无效。')
+                    passed, message, errors = verified
+                    if type(passed) is not bool or not isinstance(message, str):
+                        raise ValueError('范围检查结果类型无效。')
+                    check_results.append(passed)
+                    check_messages.append(message)
+                    if not isinstance(errors, (tuple, list)):
+                        raise ValueError('范围检查错误列表无效。')
+                    check_errors.extend(str(error)[:500] for error in errors)
+                except Exception as exc:
+                    check_results.append(False)
+                    check_messages.append('本次所选文件范围检查未完成。')
+                    check_errors.append(f'范围验证失败：{str(exc)[:500]}')
+            scope_verified = bool(check_results) and all(check_results)
+            scope_message = '；'.join(message for message in check_messages if message)
+            scope_errors = tuple(dict.fromkeys(check_errors))
         self._raise_if_cancelled(cancel_event)
         model = RunReviewModel(
-            provider_status, project_root, readable, (planned_output,), WORKFLOW_STAGES,
+            review_status, project_root, readable, (planned_output,), WORKFLOW_STAGES,
             bool(scope_verified), str(scope_message), scope_errors=tuple(scope_errors),
+            docx_data_files=tuple(project_root / item.relative_path for item in selected_sources
+                                  if item.kind == 'docx_data'),
+            docx_template_files=tuple(project_root / item.relative_path for item in selected_sources
+                                      if item.kind == 'docx'),
+            deepseek_model_preference=deepseek_model_preference,
         )
         emit_event('\u672c\u6b21\u6587\u4ef6\u8303\u56f4\u9884\u68c0\u5df2\u5b8c\u6210\u3002')
         return run, tuple(readable), tuple(selected_ids), model
@@ -629,18 +1018,26 @@ class MainWindow(FluentWindow):
         run, readable, selected_ids, model = result
         dialog = RunReviewDialog(model, self)
         self._review_dialog = dialog
-        dialog.start_requested.connect(lambda _model: self._start_run(run, readable, selected_ids))
+        dialog.start_requested.connect(lambda reviewed_model: self._start_run(
+            run, readable, selected_ids,
+            deepseek_model_preference=reviewed_model.deepseek_model_preference,
+        ))
         dialog.edit_scope_requested.connect(lambda: self.workspace.setCurrentWidget(self.project_page))
+        dialog.change_agent_requested.connect(lambda: self.workspace.setCurrentWidget(self.settings_view))
         dialog.exec()
         self._review_dialog = None
         self._run_review_pending = False
-        self.run_button.setEnabled(self._project is not None and bool(self._sources))
+        self._set_run_enabled(self._project is not None and bool(self._sources))
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
 
     def _run_review_failed(self, token, message):
         if token != self._run_review_generation:
             return
         self._run_review_pending = False
-        self.run_button.setEnabled(self._project is not None and bool(self._sources))
+        self._set_run_enabled(self._project is not None and bool(self._sources))
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
         _set_feedback(self.qa_summary, f'\u8fd0\u884c\u524d\u8303\u56f4\u9884\u68c0\u5931\u8d25\uff1a{str(message)[:1000]}', 'error')
 
     def _run_review_finished(self, token):
@@ -648,8 +1045,9 @@ class MainWindow(FluentWindow):
         if entry is not None:
             _worker, signals = entry
             signals.deleteLater()
+        self._refresh_delete_project_button()
 
-    def _start_run(self, run: Run, sources, selected_ids):
+    def _start_run(self, run: Run, sources, selected_ids, *, deepseek_model_preference=None):
         if (self.run_panel.active_worker is not None
                 or (self._active_run is not None
                     and self._active_run.run_id != run.run_id
@@ -667,12 +1065,16 @@ class MainWindow(FluentWindow):
             try:
                 # This method is reachable only after the DeepSeek-specific
                 # disclosure and consent button has been clicked.
-                authorize(run.run_id)
+                if deepseek_model_preference is None:
+                    authorize(run.run_id)
+                else:
+                    authorize(run.run_id, preference=deepseek_model_preference)
                 self._deepseek_consent_run_id = run.run_id
             except (ValueError, TypeError, RuntimeError):
                 self._show_error('DeepSeek 本次费用授权未能建立；没有发送任何请求。')
                 return
         consent_active = deepseek_client is not None
+        progress_reporter = self.run_panel.begin_progress_run(run.run_id)
 
         def revoke_consent():
             nonlocal consent_active
@@ -696,11 +1098,8 @@ class MainWindow(FluentWindow):
             try:
                 emit('运行请求已进入后台线程。')
                 state = self.workflow.start(self._project.project_id, run.run_id, self._sources,
-                                            selected_ids, cancel_event=cancel)
-                for record in state.stage_records:
-                    emit(f'{record.stage.value}：{record.status.value}')
-                for diagnostic in state.diagnostics:
-                    emit(diagnostic)
+                                            selected_ids, cancel_event=cancel,
+                                            progress=progress_reporter)
                 return finish_or_retain_consent(state)
             except Exception:
                 revoke_consent()
@@ -709,7 +1108,10 @@ class MainWindow(FluentWindow):
         def resume_operation(cancel, emit):
             try:
                 emit('正在恢复已验证的运行检查点。')
-                state = self.workflow.resume(run.run_id, self._sources, selected_ids, cancel_event=cancel)
+                state = self.workflow.resume(
+                    run.run_id, self._sources, selected_ids, cancel_event=cancel,
+                    progress=progress_reporter,
+                )
                 return finish_or_retain_consent(state)
             except Exception:
                 revoke_consent()
@@ -718,7 +1120,7 @@ class MainWindow(FluentWindow):
         def cancel_operation(cancel, emit):
             try:
                 emit('正在取消已暂停运行。')
-                state = self.workflow.cancel(run.run_id)
+                state = self.workflow.cancel(run.run_id, progress=progress_reporter)
                 return finish_or_retain_consent(RunStatus.CANCELLED if state is None else state)
             except Exception:
                 revoke_consent()
@@ -727,6 +1129,7 @@ class MainWindow(FluentWindow):
         try:
             self.runs.add(run)
             self._active_run = run
+            self._refresh_edit_project_button()
             self.artifact_list.clear()
             self.open_word_button.setEnabled(False)
             self.open_word_button.setProperty('paperPath', '')
@@ -735,14 +1138,18 @@ class MainWindow(FluentWindow):
             self.workspace.setCurrentWidget(self.run_panel)
             self.run_panel.start_operation(operation, resume_operation=resume_operation,
                                            cancel_operation=cancel_operation)
+            self._refresh_delete_project_button()
         except Exception as exc:
             revoke_consent()
             if self._active_run is run:
                 self._active_run = None
             self.run_panel.set_run_state(RunStatus.FAILED, '运行未能启动。')
+            self._refresh_delete_project_button()
             self._show_error(f'无法启动运行：{exc}')
 
     def _run_succeeded(self, result):
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
         if not hasattr(result, 'artifacts'):
             return
         if result.artifacts:
@@ -765,7 +1172,15 @@ class MainWindow(FluentWindow):
             worker.cancel()
         self._artifact_review_generation += 1
         token = self._artifact_review_generation
+        self._artifact_review_evidence_by_token[token] = tuple(state.artifacts)
         project = self._project
+        run_id = getattr(state, 'run_id', self.run_panel.run_id)
+        reporter = self.run_panel.progress_reporter
+        if reporter is not None and reporter.run_id != run_id:
+            reporter = None
+        self._artifact_review_context_by_token[token] = (
+            project.project_id, run_id, reporter,
+        )
         project_root = self.paths.root / project.relative_path
         template_source = next((project_root / source.relative_path for source in self._sources
                                 if source.kind == 'docx'), None)
@@ -779,6 +1194,7 @@ class MainWindow(FluentWindow):
         _set_feedback(self.qa_summary, '\u6b63\u5728\u540e\u53f0\u6821\u9a8c\u4ea7\u7269\u54c8\u5e0c\u5e76\u68c0\u67e5 Word \u7ed3\u6784\u2026', 'loading')
         self.open_word_button.setEnabled(False)
         self.thread_pool.start(worker)
+        self._refresh_delete_project_button()
 
     def _inspect_run_artifacts(self, state, project_root, template_source, cancel_event, emit_event):
         rows = []
@@ -885,8 +1301,13 @@ class MainWindow(FluentWindow):
         return '\n'.join(lines)
 
     def _artifact_review_succeeded(self, token, result):
-        if token != self._artifact_review_generation:
+        if (token != self._artifact_review_generation
+                or not self._artifact_review_context_is_current(token)):
             return
+        _project_id, _run_id, reporter = self._artifact_review_context_by_token[token]
+        evidence_by_path = {
+            item.relative_path: item for item in self._artifact_review_evidence_by_token.get(token, ())
+        }
         self.artifact_list.clear()
         for kind, relative_path, path, verified in result.artifacts:
             state = '\u54c8\u5e0c\u6821\u9a8c\u901a\u8fc7' if verified else '\u672a\u9a8c\u8bc1'
@@ -894,6 +1315,35 @@ class MainWindow(FluentWindow):
             if path is not None:
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
             self.artifact_list.addItem(item)
+            evidence = evidence_by_path.get(relative_path)
+            if evidence is not None:
+                review_status = 'passed' if verified else 'failed'
+                review_summary = 'SHA-256 校验通过' if verified else '路径、大小或 SHA-256 校验未通过'
+                if kind == 'paper' and verified:
+                    report = result.qa_report
+                    if report is None:
+                        review_status = 'warning'
+                        review_summary += '；Word 结构检查未完成'
+                    elif not report.package_valid or report.structural_status == 'failed':
+                        review_status = 'failed'
+                        review_summary += '；Word 结构检查未通过'
+                    elif report.structural_status == 'review_required':
+                        review_status = 'warning'
+                        review_summary += '；Word 结构需要人工复核'
+                    else:
+                        review_summary += '；Word 结构检查完成，仍需人工复核'
+                self.run_panel.run_timeline.set_artifact_review_status(
+                    evidence.evidence_id, review_status, review_summary,
+                )
+                if reporter is not None:
+                    reporter.emit(
+                        ProgressKind.ARTIFACT_REVIEWED,
+                        f'产物审核：{relative_path}',
+                        stage=evidence.stage,
+                        attempt=evidence.attempt,
+                        item_id=evidence.evidence_id,
+                        detail=review_summary,
+                    )
         paper_path = result.paper_path
         self.open_word_button.setEnabled(paper_path is not None)
         self.open_word_button.setProperty('paperPath', '' if paper_path is None else str(paper_path))
@@ -903,20 +1353,74 @@ class MainWindow(FluentWindow):
                       self._format_docx_qa_summary(result.qa_report, result.review_items), state)
 
     def _artifact_review_failed(self, token, message):
-        if token != self._artifact_review_generation:
+        if (token != self._artifact_review_generation
+                or not self._artifact_review_context_is_current(token)):
             return
+        _project_id, _run_id, reporter = self._artifact_review_context_by_token[token]
+        for evidence in self._artifact_review_evidence_by_token.get(token, ()):
+            self.run_panel.run_timeline.set_artifact_review_status(
+                evidence.evidence_id, 'failed', '产物审核失败。',
+            )
+            if reporter is not None:
+                reporter.emit(
+                    ProgressKind.ARTIFACT_REVIEWED,
+                    '产物审核未完成',
+                    stage=evidence.stage,
+                    attempt=evidence.attempt,
+                    item_id=evidence.evidence_id,
+                    detail='产物审核失败。',
+                )
         self.open_word_button.setEnabled(False)
         _set_feedback(self.qa_summary, self._format_docx_qa_summary(
             None, (f'\u4ea7\u7269\u68c0\u67e5\u5931\u8d25\uff1a{str(message)[:1000]}',)), 'error')
 
     def _artifact_review_finished(self, token):
         entry = self._artifact_review_workers.pop(token, None)
+        self._artifact_review_evidence_by_token.pop(token, None)
+        self._artifact_review_context_by_token.pop(token, None)
         if entry is not None:
             _worker, signals = entry
             signals.deleteLater()
+        self._refresh_delete_project_button()
+
+    def _artifact_review_context_is_current(self, token):
+        context = self._artifact_review_context_by_token.get(token)
+        if context is None or self._project is None:
+            return False
+        project_id, run_id, _reporter = context
+        return (
+            self._project.project_id == project_id
+            and self.run_panel.run_id == run_id
+            and self.run_panel.run_timeline.run_id == run_id
+        )
 
     def _run_failed(self, message):
+        self._refresh_edit_project_button()
+        self._refresh_delete_project_button()
         _set_feedback(self.qa_summary, f'\u8fd0\u884c\u5931\u8d25\uff1a{message}', 'error')
+
+    def _run_state_changed(self, status):
+        self._refresh_delete_project_button()
+        codex_run = self._active_run is not None and self._active_run.provider is Provider.CODEX
+        codex_run_active = codex_run and (
+            self.run_panel.active_worker is not None
+            or status in (RunStatus.CREATED, RunStatus.RUNNING, RunStatus.PAUSED)
+        )
+        self.settings_view.codex_model_button.setEnabled(not codex_run_active)
+        self.settings_view.codex_model_button.setToolTip(
+            '本次 Codex 运行结束后才能更改模型与推理强度。'
+            if codex_run_active else ''
+        )
+        deepseek_run = self._active_run is not None and self._active_run.provider is Provider.DEEPSEEK
+        deepseek_run_active = deepseek_run and (
+            self.run_panel.active_worker is not None
+            or status in (RunStatus.CREATED, RunStatus.RUNNING, RunStatus.PAUSED)
+        )
+        self.settings_view.deepseek_model_button.setEnabled(not deepseek_run_active)
+        self.settings_view.deepseek_model_button.setToolTip(
+            '本次 DeepSeek 运行结束后才能更改模型与推理强度。'
+            if deepseek_run_active else ''
+        )
 
     def _open_selected_word(self):
         raw = self.open_word_button.property('paperPath')
@@ -940,9 +1444,9 @@ class MainWindow(FluentWindow):
         token = self._codex_probe_generation
         def verify(cancel, _emit):
             verify_connection = getattr(self.codex_probe, 'verify_connection', None)
-            if callable(verify_connection):
-                return verify_connection(Provider.CODEX, cancel)
-            return self.codex_probe.verify(Provider.CODEX, cancel)
+            if not callable(verify_connection):
+                raise RuntimeError('Codex 固定连接 canary 接口不可用。')
+            return verify_connection(Provider.CODEX, cancel)
         worker = FunctionWorker(verify)
         signals = worker.signals
         self._codex_probe_workers[token] = (worker, signals)
@@ -957,6 +1461,162 @@ class MainWindow(FluentWindow):
             worker.cancel()
             self._codex_probe_workers.pop(token, None)
             self.settings_view.set_codex_probe_failure()
+
+    def _open_codex_model_settings(self):
+        preference_error = False
+        try:
+            preference = self.codex_model_preferences.load()
+        except CodexModelPreferenceError:
+            preference = None
+            preference_error = True
+        dialog = CodexModelDialog(
+            self.codex_model_preferences, preference, self,
+            preference_error=preference_error,
+        )
+        key = id(dialog)
+        self._codex_model_dialogs.add(key)
+        dialog.load_requested.connect(
+            lambda dialog=dialog: self._start_codex_model_load(dialog),
+        )
+        dialog.preference_saved.connect(self.settings_view.set_codex_model_preference)
+        self._start_codex_model_load(dialog)
+        try:
+            dialog.exec()
+        finally:
+            self._codex_model_dialogs.discard(key)
+            entry = self._codex_model_workers.get(key)
+            if entry is not None:
+                entry[1].cancel()
+            dialog.deleteLater()
+
+    def _start_codex_model_load(self, dialog):
+        if self._window_closing:
+            return
+        dialog.set_loading()
+        key = id(dialog)
+        previous = self._codex_model_workers.get(key)
+        if previous is not None:
+            previous[1].cancel()
+        worker = FunctionWorker(
+            lambda cancel, _emit: self.codex_model_service.list_models(cancel),
+        )
+        signals = worker.signals
+        self._codex_model_workers[key] = (dialog, worker, signals)
+        signals.succeeded.connect(
+            lambda models, key=key, worker=worker:
+                self._codex_model_load_succeeded(key, worker, models),
+        )
+        signals.failed.connect(
+            lambda message, key=key, worker=worker:
+                self._codex_model_load_failed(key, worker, message),
+        )
+        signals.finished.connect(
+            lambda key=key, worker=worker: self._codex_model_load_finished(key, worker),
+        )
+        try:
+            self.thread_pool.start(worker)
+        except Exception as exc:
+            worker.cancel()
+            self._codex_model_workers.pop(key, None)
+            dialog.set_load_error(str(exc))
+
+    def _open_deepseek_model_settings(self):
+        preference_error = False
+        try:
+            preference = self.deepseek_model_preferences.load()
+        except DeepSeekModelPreferenceError:
+            preference = None
+            preference_error = True
+        dialog = DeepSeekModelDialog(
+            self.deepseek_model_preferences, preference, self,
+            preference_error=preference_error,
+        )
+        key = id(dialog)
+        self._deepseek_model_dialogs.add(key)
+        dialog.load_requested.connect(
+            lambda dialog=dialog: self._start_deepseek_model_load(dialog),
+        )
+        dialog.preference_saved.connect(self.settings_view.set_deepseek_model_preference)
+        self._start_deepseek_model_load(dialog)
+        try:
+            dialog.exec()
+        finally:
+            self._deepseek_model_dialogs.discard(key)
+            entry = self._deepseek_model_workers.get(key)
+            if entry is not None:
+                entry[1].cancel()
+            dialog.deleteLater()
+
+    def _start_deepseek_model_load(self, dialog):
+        if self._window_closing:
+            return
+        dialog.set_loading()
+        key = id(dialog)
+        previous = self._deepseek_model_workers.get(key)
+        if previous is not None:
+            previous[1].cancel()
+        worker = FunctionWorker(
+            lambda cancel, _emit: self.deepseek_model_service.list_models(cancel),
+        )
+        signals = worker.signals
+        self._deepseek_model_workers[key] = (dialog, worker, signals)
+        signals.succeeded.connect(
+            lambda models, key=key, worker=worker:
+                self._deepseek_model_load_succeeded(key, worker, models),
+        )
+        signals.failed.connect(
+            lambda message, key=key, worker=worker:
+                self._deepseek_model_load_failed(key, worker, message),
+        )
+        signals.finished.connect(
+            lambda key=key, worker=worker: self._deepseek_model_load_finished(key, worker),
+        )
+        try:
+            self.thread_pool.start(worker)
+        except Exception as exc:
+            worker.cancel()
+            self._deepseek_model_workers.pop(key, None)
+            dialog.set_load_error(str(exc))
+
+    def _deepseek_model_load_succeeded(self, key, worker, models):
+        entry = self._deepseek_model_workers.get(key)
+        if (entry is None or entry[1] is not worker or key not in self._deepseek_model_dialogs
+                or self._window_closing):
+            return
+        entry[0].set_models(models)
+
+    def _deepseek_model_load_failed(self, key, worker, message):
+        entry = self._deepseek_model_workers.get(key)
+        if (entry is None or entry[1] is not worker or key not in self._deepseek_model_dialogs
+                or self._window_closing):
+            return
+        entry[0].set_load_error(message)
+
+    def _deepseek_model_load_finished(self, key, worker):
+        entry = self._deepseek_model_workers.get(key)
+        if entry is not None and entry[1] is worker:
+            self._deepseek_model_workers.pop(key, None)
+            entry[2].deleteLater()
+
+    def _codex_model_load_succeeded(self, key, worker, models):
+        entry = self._codex_model_workers.get(key)
+        if (entry is None or entry[1] is not worker or key not in self._codex_model_dialogs
+                or self._window_closing):
+            return
+        entry[0].set_models(models)
+
+    def _codex_model_load_failed(self, key, worker, message):
+        entry = self._codex_model_workers.get(key)
+        if (entry is None or entry[1] is not worker or key not in self._codex_model_dialogs
+                or self._window_closing):
+            return
+        entry[0].set_load_error(message)
+
+    def _codex_model_load_finished(self, key, worker):
+        entry = self._codex_model_workers.get(key)
+        if entry is not None and entry[1] is worker:
+            self._codex_model_workers.pop(key, None)
+            entry[2].deleteLater()
 
     def _codex_probe_succeeded(self, token, result):
         if token != self._codex_probe_generation or self._window_closing:
@@ -978,8 +1638,8 @@ class MainWindow(FluentWindow):
             signals.deleteLater()
 
     def _provider_changed(self, status):
-        self.run_button.setEnabled(self._project is not None and bool(self._sources)
-                                   and not self._run_review_pending)
+        self._set_run_enabled(self._project is not None and bool(self._sources)
+                              and not self._run_review_pending)
         self.run_button.setToolTip(status.message)
         if self._active_run is None and self.run_panel.active_worker is None:
             self.run_panel.set_provider(status.provider)
@@ -1002,6 +1662,10 @@ class MainWindow(FluentWindow):
             self._show_error('当前窗口没有可取消的运行记录。')
 
     def closeEvent(self, event):
+        if self._project_delete_workers:
+            self._show_error('正在删除项目，请等待完成后再关闭窗口。')
+            event.ignore()
+            return
         if self.run_panel.active_worker is not None:
             self.run_panel.cancel()
         run_id = self._deepseek_consent_run_id
@@ -1019,6 +1683,10 @@ class MainWindow(FluentWindow):
                 return
         self._window_closing = True
         for worker, _signals in tuple(self._codex_probe_workers.values()):
+            worker.cancel()
+        for _dialog, worker, _signals in tuple(self._codex_model_workers.values()):
+            worker.cancel()
+        for _dialog, worker, _signals in tuple(self._deepseek_model_workers.values()):
             worker.cancel()
         super().closeEvent(event)
 

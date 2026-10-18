@@ -6,7 +6,7 @@ import math
 @dataclass(frozen=True)
 class ComputationLimits:
     wall_seconds: float = 300.0
-    memory_bytes: int = 1024 * 1024 * 1024
+    memory_bytes: int = 2 * 1024 * 1024 * 1024
     stdout_bytes: int = 4 * 1024 * 1024
     stderr_bytes: int = 1024 * 1024
     artifact_bytes: int = 64 * 1024 * 1024

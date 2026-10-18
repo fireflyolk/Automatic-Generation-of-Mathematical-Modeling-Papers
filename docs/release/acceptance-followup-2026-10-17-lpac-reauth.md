@@ -77,3 +77,25 @@ The F: root DACL contains existing inheritable ACEs. Windows documents that sett
 - ACL snapshot: F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-retry-cb9c00eb62ba4dd6945c07cdc3d3f6bf\acl-before.json
 - Orchestration result: F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-retry-cb9c00eb62ba4dd6945c07cdc3d3f6bf\orchestration.json
 - Helper and driver: F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl_profile_helper.ps1, F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\run_acl_profile_retry.ps1
+## Authorized inheritance restoration and full comparison — 2026-10-18
+
+The user authorized one restoration of the workspace root DACL auto-inherited (`AI`) flag, including Windows propagation to existing descendants, and a full before/after comparison. `SetNamedSecurityInfoW` returned `0`. The workspace root now has `D:AI`, matching the saved original control flags. Windows canonicalized ACE ordering while propagating; the root ACE multiset is unchanged. No further ACL write or AppContainer profile creation was performed in this follow-up.
+
+The five authorized anchor paths were checked again after restoration. All five have the original control flags and ACE multisets, and the temporary AppContainer package SID appears in zero of them. Exact SDDL strings differ only where Windows reordered ACEs.
+
+The full comparison covered all 534 manifest partitions: 523 standard snapshots and 11 native long-path snapshots. Standard entries were 1,519,820 before and 1,520,043 after; native entries were 487,103 before and 487,247 after. The 618 direct-root paths are unchanged as a set. No entries disappeared during the two snapshots; 223 standard and 144 native path entries were added. The 223 entries were under two temporary test/build trees; sampled paths are now absent. The 144 `paths-<id>` entries recorded in the mathmodel temp tree were created during the snapshot interval; sampled creation times fall between 16:31:12Z and 16:31:36Z.
+
+ACL changes classify as follows:
+
+- Of 588,719 exact SDDL changes in standard partitions, 579,011 are ACE ordering only. The remaining 9,708 consist of 8,912 DACL control-flag updates and 796 inherited ACE instances. The 8,912 control changes are exactly 8,821 `D:` → `D:AI` and 91 `D:P` → `D:PAI` transitions.
+- The 796 ACE instances are 398 unique files, each linked under both `downloads\huawei-ict-innovation-study-space-2026-10-10\pdf-build-dependencies` and `tmp\huawei-ict-pdf-uv-cache`. Each gained the inherited ACE `(A;ID;0x1301bf;;;S-1-5-21-213357048-4285094246-4097403751-1216974287)`. This ACE already existed with inheritance flags on the original `tmp` DACL; `fsutil hardlink list` confirmed all 398 path pairs refer to the same hard-linked files. No ACE was removed and no other ACE-set change was found.
+- In the 11 native long-path partitions, all 35,499 changed common-path SDDLs are ACE ordering only. The only path-set difference there is the 144 newly created mathmodel temp entries described above.
+
+The full comparison therefore found no unexplained ACE content change. The 398 inherited ACE additions are a propagation effect from a pre-existing inheritable `tmp` ACE, and they also appear at the paired `downloads` paths because NTFS hard links share one file record. The package SID used by the earlier LPAC diagnostic remains absent from the authorized anchors. LPAC-controlled execution is still not accepted; this follow-up did not run a new profile, smoke, or canary.
+
+- Restore result: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-01\restore-ai-setnamed-evidence.json`
+- Five-path restore check: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-01\post-restore-ace-multiset-check.json`
+- Final anchor check: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-03\final-anchor-verification.json`
+- Full partition comparison: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-03\full-compare-report.json`
+- Change classification: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-03\full-compare-classification.json`
+- Hard-link verification: `F:\Codex另一个工作的地方\tmp\lpac-reauth-20261017\acl-api-run-20261017-03\hardlink-ace-propagation-check-v4.json`
