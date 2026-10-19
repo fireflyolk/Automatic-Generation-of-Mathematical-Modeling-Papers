@@ -23,8 +23,10 @@ from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation, ResultValidator
 from mathmodel_paper_studio.paper.docx_qa import run_docx_qa
 from mathmodel_paper_studio.paper.docx_writer import (
-    FigureDraft, PaperDraft, TableDraft, TextSection, write_generic_template, write_paper,
+    EquationDraft, FigureDraft, PaperDraft, SubsectionDraft, TableDraft, TextSection,
+    write_generic_template, write_paper,
 )
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping, TemplateMappingError
 from mathmodel_paper_studio.workflow.checkpoint import CheckpointStore
@@ -59,10 +61,17 @@ _SCHEMAS = {
     Stage.CODE_GENERATION: {'source': 'Python source only in this field', 'outputs': [
         {'name': 'metrics.csv', 'kind': 'table', 'columns': ['metric', 'value'], 'rows': None},
         {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]},
-    Stage.PAPER_DRAFTING: {'sections': [
-        {'section_key': 'confirmed_text_heading_key', 'paragraphs': ['prose'], 'evidence_ids': ['validated_id']}],
-        'tables': [{'section_key': 'confirmed_table_key', 'evidence_id': 'validated_table_id'}],
-        'figures': [{'section_key': 'confirmed_figure_heading_key', 'evidence_id': 'validated_figure_id', 'caption': 'caption'}]},
+    Stage.PAPER_DRAFTING: {
+        'title': 'paper title', 'keywords': ['keyword'], 'sections': [
+        {'section_key': 'confirmed_text_heading_key', 'paragraphs': ['prose'], 'evidence_ids': ['validated_id'],
+         'subsections': [{'title': 'subsection title', 'paragraphs': ['prose'],
+                          'evidence_ids': ['validated_id']}]}],
+        'equations': [{'section_key': 'confirmed_text_heading_key',
+                       'expression': 'editable equation expression', 'description': 'what the equation means',
+                       'evidence_ids': ['validated_id']}],
+        'tables': [{'section_key': 'confirmed_table_key', 'evidence_id': 'validated_table_id', 'caption': 'table caption'}],
+        'figures': [{'section_key': 'confirmed_figure_heading_key', 'evidence_id': 'validated_figure_id', 'caption': 'caption'}],
+        'references': []},
 }
 
 
@@ -345,6 +354,11 @@ class LiveWorkflowEngine(WorkflowEngine):
                              'stage': artifact.stage.value, 'data': _json(content)})
         payload = {'stage': context.stage.value, 'authorized_problem': context.authorized_problem,
                    'problem_evidence_id': context.problem_evidence_id,
+                   'paper_standard': {
+                       'standard_id': (context.paper_standard_id or get_default_paper_standard().standard_id),
+                       'version': (context.paper_standard_version or get_default_paper_standard().version),
+                       'sha256': (context.paper_standard_sha256 or get_default_paper_standard().sha256),
+                   },
                    'selected_inputs': [dict(source_id=item.source_id, name=Path(item.relative_path).name,
                                             kind=item.kind, evidence_id=item.evidence_id,
                                             profile=None if item.profile_json is None else _json(item.profile_json))
@@ -900,6 +914,7 @@ class LiveWorkflowEngine(WorkflowEngine):
             return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
                                 'Word 模板或章节映射不可用；请到 Word 模板页重新检查并保存。')
         evidence = self._validated_evidence(context)
+        standard = get_default_paper_standard()
         extras = []
         for item in evidence:
             entry = self._evidence_dict(item)
@@ -909,34 +924,51 @@ class LiveWorkflowEngine(WorkflowEngine):
                          'total_rows': len(rows), 'preview_truncated': len(rows) > 100}
             extras.append(entry)
         paper_contract = {
+            'standard': {
+                'standard_id': standard.standard_id,
+                'version': standard.version,
+                'sha256': standard.sha256,
+                'target_pages': standard.target_pages,
+                'required_sections': standard.required_sections,
+                'optional_sections': standard.optional_sections,
+            },
             'section_key_pattern': '^[a-z][a-z0-9_-]{0,63}$',
-            'section_keys_unique_across_all_text_table_and_figure_blocks': True,
+            'section_keys_unique_across_text_table_and_figure_blocks': True,
+            'equation_section_key_must_reference_a_text_section': True,
             'explanatory_text_may_have_empty_evidence_ids': True,
             'provided_evidence_ids_must_be_exact_validated_ids': True,
-            'references': 'Do not add URLs, DOI strings, or numbered reference citations.',
+            'references': 'Return an empty list unless a verified bibliographic source is explicitly supplied. Never invent or cite unverifiable works.',
+            'length': 'About 30 pages is a planning target, never a minimum. Never add filler, blank pages, repeated paragraphs, or unrelated material.',
         }
         if template is None:
             paper_contract.update({
-                'recommended_text_keys': ['abstract', 'problem_restatement', 'assumptions',
-                                          'notation', 'model', 'solution', 'verification', 'conclusion'],
+                'recommended_text_keys': list(standard.required_sections),
                 'recommended_table_keys': [f'results_table_{index + 1}'
                                            for index, item in enumerate(evidence) if item.kind == 'table'],
                 'recommended_figure_keys': [f'results_figure_{index + 1}'
                                             for index, item in enumerate(evidence) if item.kind == 'figure'],
             })
         else:
+            available_standard_sections = [key for key in standard.required_sections
+                                           if key in {item.section_key for item in template[2].bindings
+                                                      if item.kind == 'heading'}]
             paper_contract.update({
                 'allowed_text_or_figure_keys': [item.section_key for item in template[2].bindings
                                                if item.kind == 'heading'],
                 'allowed_table_keys': [item.section_key for item in template[2].bindings
                                        if item.kind == 'table'],
+                'recommended_text_keys': available_standard_sections,
+                'standard_sections_without_confirmed_template_anchor': [
+                    key for key in standard.required_sections if key not in available_standard_sections
+                ],
+                'template_section_instruction': 'Only output section keys with a confirmed heading anchor. Omit unavailable sections; the quality report will list them for review.',
             })
-        value = self._request(context, {'sections', 'tables', 'figures'}, {
+        value = self._request(context, {'title', 'keywords', 'sections', 'equations', 'tables', 'figures', 'references'}, {
             'validated_evidence': extras,
             'paper_contract': paper_contract,
             'confirmed_mapping': None if template is None else template[2].to_dict(),
             'document_layout': ('built_in_editable_word' if template is None else 'confirmed_user_template'),
-            'reference_policy': 'No verified bibliographic sources supplied; do not cite or invent any.'},
+            'reference_policy': 'No verified bibliographic sources supplied in this run. Return references as an empty list and mark citations requiring review.'},
             cancel_event, progress,
             response_validator=lambda value: self._paper_draft(context, value, evidence,
                                                                template=template))
@@ -947,59 +979,186 @@ class LiveWorkflowEngine(WorkflowEngine):
         validate_managed_path(directory)
         template_mode = 'custom'
         template_relative_path = None
+        template_source_project_relative_path = None
         if template is None:
             template = write_generic_template(directory, draft)
             template_mode = 'builtin'
             template_relative_path = template[0].relative_to(layout.root).as_posix()
+        else:
+            template_source_project_relative_path = template[0].relative_to(layout.project_root).as_posix()
         result = write_paper(template[0], directory, template[1], template[2], draft)
         paper_evidence = ArtifactEvidence(
             'ev_' + hashlib.sha256(f'{context.run_id}\0{result.sha256}\0{result.path.name}'.encode()).hexdigest()[:24],
             context.run_id, layout.project_relative(result.path.relative_to(layout.root).as_posix()),
             result.sha256, 'paper', True)
-        used = tuple(dict.fromkeys(eid for block in (*draft.sections, *draft.tables, *draft.figures)
-                                   for eid in block.evidence_ids))
+        used = tuple(dict.fromkeys(
+            eid
+            for block in (*draft.sections, *draft.tables, *draft.figures, *draft.equations)
+            for eid in (
+                block.evidence_ids + tuple(
+                    nested_id for subsection in getattr(block, 'subsections', ())
+                    for nested_id in subsection.evidence_ids
+                )
+            )
+        ))
+        standard_sections = tuple(item.section_key for item in draft.sections)
+        standard_record = {
+            'standard_id': standard.standard_id,
+            'version': standard.version,
+            'sha256': standard.sha256,
+            'target_pages': standard.target_pages,
+        }
         manifest = {'paper_evidence': self._evidence_dict(paper_evidence),
                     'template_sha256': result.source_sha256, 'mapping': template[2].to_dict(),
                     'template_mode': template_mode, 'template_relative_path': template_relative_path,
-                    'required_sections': [item.section_key for item in draft.sections],
+                    'template_source_project_relative_path': template_source_project_relative_path,
+                    'paper_standard': standard_record,
+                    'standard_required_sections': list(standard.required_sections),
+                    'standard_optional_sections': list(standard.optional_sections),
+                    'standard_sections_included': standard_sections,
+                    'required_sections': list(standard_sections),
                     'required_figures': [item.section_key for item in draft.figures],
+                    'equation_count': len(draft.equations),
+                    'keyword_count': len(draft.keywords),
+                    'reference_count': 0,
+                    'pending_references': list(draft.pending_references),
                     'expected_evidence_ids': used, 'human_review_required': True,
                     'mathematical_correctness_verified': False}
         return self._complete(context, self._output('paper-manifest.json', manifest))
 
     def _paper_draft(self, context, value, evidence, *, template=None):
         indexed = {item.evidence_id: item for item in evidence}
-        sections, tables, figures = [], [], []
-        for key in ('sections', 'tables', 'figures'):
+        sections, equations, tables, figures = [], [], [], []
+        standard = get_default_paper_standard()
+        if template is None:
+            allowed_text_keys = set(standard.required_sections + standard.optional_sections)
+            allowed_table_keys = None
+            allowed_figure_keys = None
+        else:
+            allowed_text_keys = {item.section_key for item in template[2].bindings
+                                 if item.kind == 'heading'}
+            allowed_table_keys = {item.section_key for item in template[2].bindings
+                                  if item.kind == 'table'}
+            allowed_figure_keys = set(allowed_text_keys)
+        for key in ('keywords', 'sections', 'equations', 'tables', 'figures', 'references'):
             if not isinstance(value[key], list) or len(value[key]) > 64:
                 raise ValueError('论文块集合无效。')
         if not value['sections']:
             raise ValueError('论文至少需要一个正文块。')
+        if not isinstance(value['title'], str) or not value['title'].strip() or len(value['title']) > 500:
+            raise ValueError('论文标题无效。')
+        keywords = _strings(value['keywords'], nonempty=False, maximum=32, chars=80)
+        agent_reference_section = any(
+            isinstance(item, dict) and item.get('section_key') == 'references'
+            for item in value['sections'])
+        if value['references'] or agent_reference_section:
+            pending_reference = ('Agent 返回了未绑定可验证来源的参考文献；该列表未写入论文，请人工补充真实来源。',)
+        else:
+            pending_reference = ()
         for item in value['sections']:
-            if not isinstance(item, dict) or set(item) != {'section_key', 'paragraphs', 'evidence_ids'}:
+            base_fields = {'section_key', 'paragraphs', 'evidence_ids'}
+            if (not isinstance(item, dict)
+                    or set(item) not in (base_fields, base_fields | {'subsections'})):
                 raise ValueError('正文块字段无效。')
+            section_key = item['section_key']
+            if (not isinstance(section_key, str)
+                    or re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', section_key) is None):
+                raise ValueError('正文块引用了未定义或未映射的章节键。')
+            if section_key == 'references':
+                continue
+            if section_key not in allowed_text_keys:
+                raise ValueError('正文块引用了未定义或未映射的章节键。')
             ids = _strings(item['evidence_ids'], nonempty=False)
             if any(eid not in indexed for eid in ids):
                 raise ValueError('正文引用未经验证的结果。')
             paragraphs = _strings(item['paragraphs'], chars=16000)
-            if any(re.search(r'https?://|\bdoi\s*:|\[[0-9]+\]', paragraph, re.I) for paragraph in paragraphs):
-                raise ValueError('没有已验证文献，正文不能新增文献引用。')
-            sections.append(TextSection(item['section_key'], paragraphs, ids, (_HUMAN_REVIEW,)))
+            has_unverified_citation = any(
+                re.search(r'https?://|\bdoi\s*:|\[[0-9]+\]', paragraph, re.I)
+                for paragraph in paragraphs)
+            review_notes = [_HUMAN_REVIEW]
+            if has_unverified_citation:
+                review_notes.append('正文包含未验证引用标记，请核对来源后再提交。')
+            raw_subsections = item.get('subsections', [])
+            if not isinstance(raw_subsections, list) or len(raw_subsections) > 32:
+                raise ValueError('小节集合无效或超过上限。')
+            subsections = []
+            for subsection in raw_subsections:
+                if (not isinstance(subsection, dict)
+                        or set(subsection) != {'title', 'paragraphs', 'evidence_ids'}):
+                    raise ValueError('小节字段无效。')
+                subsection_ids = _strings(subsection['evidence_ids'], nonempty=False)
+                if any(eid not in indexed for eid in subsection_ids):
+                    raise ValueError('小节引用未经验证的结果。')
+                subsection_paragraphs = _strings(subsection['paragraphs'], chars=16000)
+                subsection_review_notes = list(review_notes)
+                if any(re.search(r'https?://|\bdoi\s*:|\[[0-9]+\]', paragraph, re.I)
+                       for paragraph in subsection_paragraphs):
+                    subsection_review_notes.append('小节包含未验证引用标记，请核对来源后再提交。')
+                subsections.append(SubsectionDraft(
+                    subsection['title'], subsection_paragraphs, subsection_ids,
+                    tuple(subsection_review_notes),
+                ))
+            sections.append(TextSection(section_key, paragraphs, ids, tuple(review_notes), tuple(subsections)))
+        if 'references' not in {item.section_key for item in sections}:
+            mapped_headings = ({item.section_key for item in template[2].bindings
+                                if item.kind == 'heading'} if template is not None else set(standard.required_sections))
+            if 'references' in mapped_headings:
+                sections.append(TextSection(
+                    'references',
+                    ('本次运行未提供可核验参考资料；提交前请根据真实来源补充。',),
+                    (), ('需要人工补充可核验参考资料。',),
+                ))
+        section_keys = {item.section_key for item in sections}
+        for item in value['equations']:
+            expected = {'section_key', 'expression', 'description', 'evidence_ids'}
+            if not isinstance(item, dict) or set(item) != expected:
+                raise ValueError('公式块字段无效。')
+            if (not isinstance(item['section_key'], str)
+                    or re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', item['section_key']) is None):
+                raise ValueError('公式章节键无效。')
+            ids = _strings(item['evidence_ids'], nonempty=False)
+            if any(eid not in indexed for eid in ids):
+                raise ValueError('公式引用未经验证的结果。')
+            if item['section_key'] not in section_keys:
+                raise ValueError('公式必须隶属于当前论文中的正文部分。')
+            equations.append(EquationDraft(item['section_key'], item['expression'], item['description'], ids))
         for key, kind in (('tables', 'table'), ('figures', 'figure')):
-            expected = {'section_key', 'evidence_id'} | ({'caption'} if kind == 'figure' else set())
+            expected = ({'section_key', 'evidence_id', 'caption'} if kind == 'table'
+                        else {'section_key', 'evidence_id', 'caption'})
             for item in value[key]:
                 if not isinstance(item, dict) or set(item) != expected:
                     raise ValueError('图表块字段无效。')
+                section_key = item['section_key']
+                if (not isinstance(section_key, str)
+                        or re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', section_key) is None):
+                    raise ValueError('图表章节键无效。')
+                if not isinstance(item['evidence_id'], str):
+                    raise ValueError('图表证据标识无效。')
                 artifact = indexed.get(item['evidence_id'])
                 if artifact is None or artifact.kind != kind:
                     raise ValueError('图表引用未经验证的结果。')
                 if kind == 'table':
+                    if (allowed_table_keys is not None and section_key not in allowed_table_keys
+                            or allowed_table_keys is None
+                            and re.fullmatch(r'results_table_[1-9][0-9]{0,2}', section_key) is None):
+                        raise ValueError('表格引用了未定义或未映射的锚点键。')
                     headers, rows = self._table_values(context, artifact)
-                    tables.append(TableDraft(item['section_key'], headers, rows, (artifact.evidence_id,)))
+                    tables.append(TableDraft(section_key, headers, rows,
+                                             (artifact.evidence_id,), caption=item['caption']))
                 else:
-                    figures.append(FigureDraft(item['section_key'], self._result_bytes(context, artifact),
+                    if (allowed_figure_keys is not None and section_key not in allowed_figure_keys
+                            or allowed_figure_keys is None
+                            and re.fullmatch(r'results_figure_[1-9][0-9]{0,2}', section_key) is None):
+                        raise ValueError('图片引用了未定义或未映射的标题键。')
+                    figures.append(FigureDraft(section_key, self._result_bytes(context, artifact),
                                                'png', item['caption'], (artifact.evidence_id,)))
-        draft = PaperDraft(tuple(sections), tuple(tables), tuple(figures))
+        order = {key: index for index, key in enumerate(standard.required_sections + standard.optional_sections)}
+        sections.sort(key=lambda item: (order.get(item.section_key, len(order)), item.section_key))
+        draft = PaperDraft(
+            sections=tuple(sections), tables=tuple(tables), figures=tuple(figures),
+            pending_references=pending_reference, equations=tuple(equations),
+            title=value['title'], keywords=keywords,
+        )
         blocks = (*draft.sections, *draft.tables, *draft.figures)
         if any(not isinstance(item.section_key, str)
                or re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', item.section_key) is None
@@ -1015,6 +1174,16 @@ class LiveWorkflowEngine(WorkflowEngine):
 
     def _qa(self, context):
         manifest = self._latest(context, Stage.PAPER_DRAFTING, 'paper-manifest.json')
+        standard = get_default_paper_standard()
+        standard_record = manifest.get('paper_standard')
+        if standard_record != {
+                'standard_id': standard.standard_id,
+                'version': standard.version,
+                'sha256': standard.sha256,
+                'target_pages': standard.target_pages,
+        }:
+            return self._paused(context.stage, context.attempt, PauseReason.VALIDATION_FAILED,
+                                '论文规范版本与本次清单不一致，无法确认规范质量报告。')
         if manifest.get('template_mode') == 'builtin':
             try:
                 template_path = self._layout(context).path_for(manifest['template_relative_path'])
@@ -1044,7 +1213,12 @@ class LiveWorkflowEngine(WorkflowEngine):
         report = run_docx_qa(paper, template[1], template[2],
                              required_section_keys=manifest['required_sections'],
                              required_figure_keys=manifest['required_figures'],
-                             expected_evidence_ids=manifest['expected_evidence_ids'])
+                             expected_evidence_ids=manifest['expected_evidence_ids'],
+                             standard=standard,
+                             standard_sections=manifest.get('standard_sections_included', ()),
+                             keyword_count=manifest.get('keyword_count'),
+                             expected_equation_count=manifest.get('equation_count'),
+                             pending_references=manifest.get('pending_references', ()))
         output = self._output('docx-qa.json', {**asdict(report), 'human_review_required': True,
                                              'mathematical_correctness_verified': False}, 'validation')
         if not report.package_valid or report.structural_status == 'failed':

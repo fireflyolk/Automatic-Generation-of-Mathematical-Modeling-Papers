@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QUrl, QThreadPool, Signal
@@ -43,6 +44,7 @@ from mathmodel_paper_studio.execution.windows_sandbox import (
     resolve_computation_runtime_root,
 )
 from mathmodel_paper_studio.paper.docx_qa import DocxQaReport, run_docx_qa
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.projects.manifest import latest_manifest
@@ -504,6 +506,8 @@ class MainWindow(FluentWindow):
             templates = [item for item in sources if item.kind == 'docx']
             if templates:
                 self.template_view.set_template_path(project_root / templates[0].relative_path)
+            else:
+                self.template_view.set_builtin_standard()
             self._set_run_enabled(bool(sources) and not self._run_review_pending)
             self._refresh_edit_project_button()
         except (OSError, ValueError, TypeError) as exc:
@@ -842,6 +846,19 @@ class MainWindow(FluentWindow):
             self._show_error(f'无法打开项目编辑器：{str(exc)[:1000]}')
 
     def _selection_changed(self, *_):
+        if self._project is not None and self._sources:
+            selected_ids = set(self._selected_sources()[1])
+            selected_templates = tuple(
+                source for source in self._sources
+                if source.kind == 'docx' and source.source_id in selected_ids
+            )
+            project_root = validate_managed_path(self.paths.root / self._project.relative_path)
+            if len(selected_templates) == 1:
+                candidate = project_root / selected_templates[0].relative_path
+                if self.template_view.template_path != candidate:
+                    self.template_view.set_template_path(candidate)
+            elif not selected_templates and self.template_view.template_path is not None:
+                self.template_view.set_builtin_standard()
         self._set_run_enabled(self._project is not None and bool(self._sources)
                               and not self._run_review_pending)
 
@@ -1200,6 +1217,7 @@ class MainWindow(FluentWindow):
         rows = []
         review_items = []
         paper_path = None
+        paper_manifest_path = None
         for index, artifact in enumerate(state.artifacts, start=1):
             self._raise_if_cancelled(cancel_event)
             path = None
@@ -1230,13 +1248,71 @@ class MainWindow(FluentWindow):
                     paper_path = path
                 else:
                     review_items.append('\u8bba\u6587\u4ea7\u7269\u4e0d\u662f DOCX \u6587\u4ef6\u3002')
+            if verified and Path(artifact.relative_path).name == 'paper-manifest.json':
+                paper_manifest_path = path
             emit_event(f'\u5df2\u68c0\u67e5\u4ea7\u7269 {index}/{len(state.artifacts)}\u3002')
 
         report = None
         if paper_path is None:
             review_items.append('\u672a\u627e\u5230\u53ef\u6821\u9a8c\u54c8\u5e0c\u7684 DOCX \u8bba\u6587\u3002')
+        elif paper_manifest_path is not None:
+            try:
+                if paper_manifest_path.stat().st_size > 1024 * 1024:
+                    raise ValueError('论文清单超过大小上限。')
+                manifest = json.loads(paper_manifest_path.read_text(encoding='utf-8'))
+                run_root = validate_managed_path(project_root / '90_runs' / state.run_id)
+                template_mode = manifest.get('template_mode')
+                if template_mode == 'builtin':
+                    relative_template = manifest.get('template_relative_path')
+                    relative = PurePosixPath(relative_template) if isinstance(relative_template, str) else None
+                    if (relative is None or not relative_template or relative.is_absolute() or '\\' in relative_template
+                            or any(part in ('', '.', '..') for part in relative.parts)):
+                        raise ValueError('内置模板相对路径无效。')
+                    source_template = validate_managed_path(run_root.joinpath(*relative.parts))
+                    if not source_template.resolve(strict=True).is_relative_to(run_root.resolve(strict=True)):
+                        raise ValueError('内置模板路径离开本次运行目录。')
+                elif template_mode == 'custom':
+                    relative_template = manifest.get('template_source_project_relative_path')
+                    relative = PurePosixPath(relative_template) if isinstance(relative_template, str) else None
+                    if (relative is not None and relative_template and not relative.is_absolute()
+                            and '\\' not in relative_template
+                            and all(part not in ('', '.', '..') for part in relative.parts)):
+                        source_template = validate_managed_path(project_root.joinpath(*relative.parts))
+                        if not source_template.resolve(strict=True).is_relative_to(project_root.resolve(strict=True)):
+                            raise ValueError('自定义模板路径离开项目目录。')
+                    elif template_source is not None:
+                        source_template = validate_managed_path(template_source)
+                    else:
+                        raise ValueError('论文清单缺少自定义模板相对路径。')
+                else:
+                    raise ValueError('论文清单中的模板模式不可用。')
+                inspection = inspect_template(source_template)
+                if inspection.template_sha256 != manifest.get('template_sha256'):
+                    raise ValueError('论文模板哈希与本次清单不一致。')
+                mapping = TemplateMapping.from_dict(manifest['mapping'])
+                mapping.validate_for(inspection)
+                standard = get_default_paper_standard()
+                standard_record = manifest.get('paper_standard', {})
+                if (standard_record.get('standard_id') != standard.standard_id
+                        or standard_record.get('version') != standard.version
+                        or standard_record.get('sha256') != standard.sha256):
+                    review_items.append('论文规范版本与当前内置版本不同；已按清单记录的 DOCX 结构继续检查。')
+                expected_evidence = manifest.get('expected_evidence_ids', [])
+                report = run_docx_qa(
+                    paper_path, inspection, mapping,
+                    required_section_keys=manifest.get('required_sections', ()),
+                    required_figure_keys=manifest.get('required_figures', ()),
+                    expected_evidence_ids=expected_evidence,
+                    standard=standard,
+                    standard_sections=manifest.get('standard_sections_included', ()),
+                    keyword_count=manifest.get('keyword_count'),
+                    expected_equation_count=manifest.get('equation_count'),
+                    pending_references=manifest.get('pending_references', ()),
+                )
+            except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
+                review_items.append(f'论文清单或模板无法完成结构检查：{str(exc)[:500]}')
         elif template_source is None:
-            review_items.append('\u6ca1\u6709\u53ef\u7528\u7684\u6e90 Word \u6a21\u677f\uff0c\u7ed3\u6784\u68c0\u67e5\u672a\u8fd0\u884c\u3002')
+            review_items.append('\u6ca1\u6709\u53ef\u7528\u7684\u6e90 Word \u6a21\u677f\uff0c\u4e14\u8fd0\u884c\u6e05\u5355\u4e0d\u5b58\u5728\uff0c\u7ed3\u6784\u68c0\u67e5\u672a\u8fd0\u884c\u3002')
         else:
             try:
                 inspection = inspect_template(template_source)
@@ -1293,8 +1369,14 @@ class MainWindow(FluentWindow):
                 ('\u5f85\u4eba\u5de5\u6838\u9a8c', report.pending_reviews),
                 ('\u7f3a\u5c11\u8bc1\u636e\u5f15\u7528', report.missing_evidence),
                 ('\u4ea7\u7269\u5305\u68c0\u67e5\u9519\u8bef', report.package_errors),
+                ('\u8bba\u6587\u8d28\u91cf\u5efa\u8bae', report.quality_warnings),
             )
             lines.extend(f'{label}\uff1a{"; ".join(values)}' for label, values in groups if values)
+            if report.standard_id is not None:
+                lines.append(f'论文规范：{report.standard_id} {report.standard_version}（SHA-256 {report.standard_sha256}）')
+                lines.append(f'篇幅目标：约 {report.target_pages} 页；实际页数：'
+                             f'{report.actual_pages if report.actual_pages is not None else "未渲染，未知"}')
+                lines.append(f'公式对象数：{report.equation_count}；编号检查：{report.caption_numbering_status}')
         lines.extend(f'\u590d\u6838\u9879\uff1a{item}' for item in review_items)
         lines.append('\u6570\u5b66\u7ed3\u8bba\u548c\u6570\u503c\u5c1a\u672a\u72ec\u7acb\u9a8c\u8bc1\uff0c\u8bf7\u4eba\u5de5\u590d\u6838\u3002')
         lines.append('Word \u9875\u9762\u6e32\u67d3\uff1a\u672a\u6267\u884c\u3002')

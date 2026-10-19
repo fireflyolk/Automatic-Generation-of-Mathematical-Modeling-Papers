@@ -132,7 +132,7 @@ class ProjectWizard(QDialog):
         files_layout = QVBoxLayout(files_card)
         files_layout.addWidget(TitleLabel('数据与 Word 模板', files_card))
         source_help = CaptionLabel(
-            '可从任意本地磁盘（如 C:、D:、F:）导入 CSV/XLSX/DOCX，可多选最多 32 个；DOCX 模板单独选择。源文件会复制到 F: 应用数据目录，原件保持不变。',
+            '可从任意本地磁盘（如 C:、D:、F:）导入 CSV/XLSX/DOCX，可多选最多 32 个；DOCX 模板单独选择。未选模板时默认使用内置 B078 论文格式。源文件会复制到 F: 应用数据目录，原件保持不变。',
             files_card,
         )
         source_help.setWordWrap(True)

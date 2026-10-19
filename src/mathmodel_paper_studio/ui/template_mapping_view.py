@@ -18,12 +18,16 @@ from mathmodel_paper_studio.paper.template_inspector import (
     TemplateInspection, UnsupportedTemplateError, inspect_template,
 )
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.ui.workers import FunctionWorker
 
 _SECTIONS = (
-    ('abstract', '摘要'), ('problem_restatement', '问题重述'), ('assumptions', '模型假设'),
-    ('notation', '符号说明'), ('model', '模型建立'), ('solution', '模型求解'),
-    ('verification', '模型检验'), ('conclusion', '结论'), ('references', '参考文献'),
+    ('abstract', '摘要'), ('problem_restatement', '问题重述'), ('problem_analysis', '问题分析'),
+    ('assumptions', '模型假设'), ('notation', '符号说明'), ('model', '模型建立'),
+    ('solution', '模型求解'), ('results', '结果与讨论'), ('verification', '模型检验'),
+    ('sensitivity_analysis', '灵敏度分析（可选）'), ('robustness_check', '稳健性分析（可选）'),
+    ('computational_complexity', '算法复杂度（可选）'), ('conclusion', '结论'),
+    ('references', '参考文献'), ('appendix', '附录（可选）'),
 )
 _STATUS_SYSTEM_COLORS = {
     'success': FluentSystemColor.SUCCESS_FOREGROUND,
@@ -102,7 +106,10 @@ class TemplateMappingView(QWidget):
             '只允许使用当前 F: 项目目录内已导入的 DOCX；来源模板以只读方式检查。',
             template_card,
         ))
-        self.template_label = BodyLabel('尚未选择模板', template_card)
+        standard = get_default_paper_standard()
+        self.template_label = BodyLabel(
+            f'{standard.display_name}（内置默认）', template_card,
+        )
         self.template_label.setObjectName('templateMappingSelectedPath')
         self.template_label.setAccessibleName('当前 Word 模板路径')
         self.template_label.setWordWrap(True)
@@ -116,7 +123,10 @@ class TemplateMappingView(QWidget):
         template_actions.addWidget(self.choose_button, 0, Qt.AlignmentFlag.AlignLeft)
         template_actions.addStretch(1)
         template_layout.addLayout(template_actions)
-        self.template_status_label = BodyLabel('尚未选择模板。', template_card)
+        self.template_status_label = BodyLabel(
+            '未选择自定义模板时，将使用内置 B078 论文格式；内容检查统一使用同一规范版本。',
+            template_card,
+        )
         self.template_status_label.setObjectName('templateMappingStatus')
         self.template_status_label.setAccessibleName('模板检查状态')
         self.template_status_label.setWordWrap(True)
@@ -217,6 +227,12 @@ class TemplateMappingView(QWidget):
         if self._worker is not None:
             _set_status(self.template_status_label, 'loading', '项目已切换；旧模板检查结果将被丢弃。')
 
+    def set_builtin_standard(self):
+        """Select the app-owned B078 style when the project has no custom DOCX."""
+        self._generation += 1
+        self._pending_template = None
+        self._reset_template_state()
+
     def _clear_mapping_choices(self):
         while self.form.rowCount():
             self.form.removeRow(0)
@@ -228,8 +244,12 @@ class TemplateMappingView(QWidget):
         self.template_path = None
         self.inspection = None
         self._clear_mapping_choices()
-        self.template_label.setText('尚未选择模板')
-        _set_status(self.template_status_label, 'neutral', '尚未选择模板。')
+        standard = get_default_paper_standard()
+        self.template_label.setText(f'{standard.display_name}（内置默认）')
+        _set_status(
+            self.template_status_label, 'neutral',
+            f'当前使用内置 B078 论文格式 {standard.version}；也可选择项目中的 DOCX 模板。',
+        )
         _set_status(self.save_status_label, 'neutral',
                     '完成至少一项章节映射后，可将新版本保存到当前 F: 项目。')
         if self._worker is None:
@@ -358,7 +378,8 @@ class TemplateMappingView(QWidget):
         self.mapping_empty_label.hide()
         self.mapping_scroll_area.show()
         _set_status(self.template_status_label, 'success',
-                    f'检查完成：{len(headings)} 个标题锚点、{len(tables)} 个表格锚点；请逐项确认映射。')
+                    f'检查完成：{len(headings)} 个标题锚点、{len(tables)} 个表格锚点；'
+                    '此 DOCX 只控制版式，论文内容仍按内置 B078 规范检查。')
         _set_status(self.save_status_label, 'neutral', '至少选择一个锚点后，即可保存当前映射版本。')
         self.inspection_loaded.emit(inspection)
         self._update_save()

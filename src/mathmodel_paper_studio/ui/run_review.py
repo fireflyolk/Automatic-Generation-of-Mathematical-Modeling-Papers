@@ -18,6 +18,7 @@ from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
 from mathmodel_paper_studio.domain.models import Stage
 from mathmodel_paper_studio.security.path_guard import selected_path
 from mathmodel_paper_studio.security.scope_manifest import EXTERNAL_PROCESSING_NOTICE
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 
 _PROVIDER_LABELS = {
     Provider.CODEX: 'Codex', Provider.DEEPSEEK: 'DeepSeek API',
@@ -67,6 +68,8 @@ class RunReviewModel:
             docx_templates = tuple(validate_managed_path(Path(item)) for item in self.docx_template_files)
             if any(path.suffix.casefold() != '.docx' for path in (*docx_data, *docx_templates)):
                 errors.append('DOCX 数据或模板清单包含非 DOCX 文件。')
+            if len(docx_templates) > 1:
+                errors.append('本次只能选择一个自定义 Word 模板；取消多余模板的勾选，或使用内置 B078 格式。')
             if not set((*docx_data, *docx_templates)).issubset(reads):
                 errors.append('DOCX 数据或模板必须包含在本次可读文件范围内。')
             if not reads:
@@ -139,8 +142,13 @@ class RunReviewModel:
             provider_state = '本机无执行环境策略已验证；正式运行仍会再次检查文件范围。'
         else:
             provider_state = '本次可信预检通过' if self.provider_ready else (status.message or '本次预检未通过')
+        standard = get_default_paper_standard()
+        template_mode = ('自定义 DOCX 模板控制版式；B078 内容规范继续适用。'
+                         if self.docx_template_files else '使用软件内置 B078 DOCX 格式。')
         lines = [
             f'Agent：{provider}', f'Agent 状态：{provider_state}', f'项目目录：{self.project_root}',
+            f'论文规范：{standard.display_name} {standard.version}（SHA-256 {standard.sha256}）',
+            f'Word 版式：{template_mode}',
             '本次可读取文件：',
         ]
         if status.provider is Provider.DEEPSEEK:
@@ -169,6 +177,7 @@ class RunReviewModel:
             lines.append('DOCX 数据处理：会提取正文段落和表格文本，作为未信任文本发送给所选 Agent；DOCX 不作为附件上传。')
         if self.docx_template_files:
             lines.append('Word 模板只在本机用于生成和校验文档，不会上传。')
+            lines.append('自定义模板缺少 {{title}} 或 {{keywords}} 占位符时，应用会在文档开头用模板现有 Title/Caption 样式补入题目和关键词。')
         lines.append('格式纠正重试：若 Agent 首次回复不是合法 JSON，应用会将相同阶段请求附加固定格式说明后重试一次；可能增加服务用量。')
         lines.append('计算失败恢复：若 Sandbox 返回受支持的程序错误或输出结构校验失败，应用最多向所选 Agent 发送两次生成代码和筛选后的错误摘要，请求修复后仍在 Sandbox 重跑；可能增加服务用量，不发送原始 stderr。')
         for path in self.readable_files:

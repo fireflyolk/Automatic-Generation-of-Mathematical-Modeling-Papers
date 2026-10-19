@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 
 from mathmodel_paper_studio.agents.preflight import Provider
 from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
@@ -10,6 +11,7 @@ from mathmodel_paper_studio.inputs.csv_reader import read_csv
 from mathmodel_paper_studio.inputs.docx_reader import read_docx
 from mathmodel_paper_studio.inputs.profiling import ImportLimits, profile_table, read_bounded
 from mathmodel_paper_studio.inputs.xlsx_reader import read_xlsx
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.workflow.stages import ArtifactDigest, PauseReason
 
 
@@ -75,6 +77,9 @@ class StageContext:
     upstream_artifacts: tuple[ArtifactDigest, ...]
     trust_notice: str
     output_directory: Path | None = None
+    paper_standard_id: str | None = None
+    paper_standard_version: str | None = None
+    paper_standard_sha256: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, 'stage', Stage(self.stage))
@@ -85,6 +90,11 @@ class StageContext:
             raise ValueError('修复次数必须在 0–2 之间。')
         if not self.system_instructions or not self.trust_notice:
             raise ValueError('阶段上下文缺少应用规则或信任说明。')
+        standard_fields = (self.paper_standard_id, self.paper_standard_version, self.paper_standard_sha256)
+        if any(item is not None for item in standard_fields):
+            if (any(not isinstance(item, str) or not item for item in standard_fields)
+                    or re.fullmatch(r'[0-9a-f]{64}', self.paper_standard_sha256) is None):
+                raise ValueError('论文规范上下文标识无效。')
         if self.problem_evidence_id is not None:
             identifier(self.problem_evidence_id)
         if (self.authorized_problem is None) != (self.problem_evidence_id is None):
@@ -194,12 +204,19 @@ class ContextBuilder:
                 not isinstance(item, ArtifactDigest) for item in upstream_artifacts):
             raise ContextInputError(PauseReason.AMBIGUOUS_DATA, '阶段引用的上游证据无效。')
         upstream = tuple(item for item in upstream_artifacts if item.stage in _ARTIFACT_INPUTS[stage])
+        standard = get_default_paper_standard()
+        instructions = _STAGE_INSTRUCTIONS[stage]
+        if stage.value in standard.stage_rules:
+            instructions += '\n' + standard.guidance_for(stage)
         return StageContext(stage=stage, attempt=attempt, run_id=self.run.run_id,
                             project_id=self.project.project_id, provider=self.run.provider,
-                            system_instructions=_STAGE_INSTRUCTIONS[stage], authorized_problem=problem,
+                            system_instructions=instructions, authorized_problem=problem,
                             problem_evidence_id=problem_evidence_id, inputs=tuple(input_refs),
                             upstream_artifacts=upstream, trust_notice=_UNTRUSTED_NOTICE,
-                            output_directory=None if output_directory is None else Path(output_directory))
+                            output_directory=None if output_directory is None else Path(output_directory),
+                            paper_standard_id=standard.standard_id,
+                            paper_standard_version=standard.version,
+                            paper_standard_sha256=standard.sha256)
 
     def _verified_copy(self, source: SourceFile) -> tuple[Path, bytes]:
         try:
