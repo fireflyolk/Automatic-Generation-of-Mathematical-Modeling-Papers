@@ -17,6 +17,7 @@ from mathmodel_paper_studio.agents.deepseek_model_preferences import DeepSeekMod
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.domain.models import Run, RunStatus, SourceFile, Stage, StageStatus
 from mathmodel_paper_studio.execution.python_runner import PythonRunner, RunArtifactLayout, _atomic_create, _evidence
+from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.projects.project_service import ProjectService
@@ -117,6 +118,153 @@ class FakeComputation:
                                script_evidence=_evidence(layout, script.relative_to(layout.root).as_posix(), 'script', script),
                                summary_evidence=_evidence(layout, summary.relative_to(layout.root).as_posix(), 'validation', summary),
                                artifacts=tuple(artifacts))
+
+
+class FailOnceComputation(FakeComputation):
+    def __init__(self, *, fail_after_repair=False):
+        super().__init__(StageStatus.PAUSED)
+        self.fail_after_repair = fail_after_repair
+
+    def run(self, layout, source, *, input_files=(), deterministic_seed=0, attempt=0,
+            cancel_event=None, expected_outputs=(), input_hashes=None):
+        if attempt == 0:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': True, 'exit_code': 1,
+                                      'blocked_reason': '受控诊断：NameError，generated.py 第 233 行，未定义名称 R_ARE。',
+                                      'failure_summary': ExecutionFailureSummary('NameError', 233, 'R_ARE')})
+        if self.fail_after_repair:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': True, 'exit_code': 1,
+                                      'blocked_reason': '受控诊断：NameError，generated.py 第 234 行。',
+                                      'failure_summary': ExecutionFailureSummary('NameError', 234, None)})
+        self.status = StageStatus.COMPLETED
+        return super().run(layout, source, input_files=input_files,
+                           deterministic_seed=deterministic_seed, attempt=attempt,
+                           cancel_event=cancel_event, expected_outputs=expected_outputs,
+                           input_hashes=input_hashes)
+
+
+class LegacyFailureThenDetailComputation(FakeComputation):
+    def __init__(self):
+        super().__init__(StageStatus.PAUSED)
+
+    def run(self, layout, source, *, input_files=(), deterministic_seed=0, attempt=0,
+            cancel_event=None, expected_outputs=(), input_hashes=None):
+        if attempt < 2:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            values = {'stage_status': StageStatus.PAUSED, 'execution_started': True,
+                      'exit_code': 1, 'blocked_reason': 'controlled generated-code failure'}
+            if attempt == 1:
+                values['failure_summary'] = ExecutionFailureSummary('NameError', 233, 'R_ARE')
+            return SimpleNamespace(**{**vars(result), **values})
+        self.status = StageStatus.COMPLETED
+        return super().run(layout, source, input_files=input_files,
+                           deterministic_seed=deterministic_seed, attempt=attempt,
+                           cancel_event=cancel_event, expected_outputs=expected_outputs,
+                           input_hashes=input_hashes)
+
+
+class PreflightThenFailureComputation(FakeComputation):
+    def __init__(self):
+        super().__init__(StageStatus.PAUSED)
+
+    def run(self, layout, source, *, input_files=(), deterministic_seed=0, attempt=0,
+            cancel_event=None, expected_outputs=(), input_hashes=None):
+        if attempt < 2:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': False, 'exit_code': None,
+                                      'blocked_reason': 'runtime preflight unavailable'})
+        if attempt == 2:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': True, 'exit_code': 1,
+                                      'blocked_reason': 'controlled generated-code failure',
+                                      'failure_summary': ExecutionFailureSummary('NameError', 233, 'R_ARE')})
+        self.status = StageStatus.COMPLETED
+        return super().run(layout, source, input_files=input_files,
+                           deterministic_seed=deterministic_seed, attempt=attempt,
+                           cancel_event=cancel_event, expected_outputs=expected_outputs,
+                           input_hashes=input_hashes)
+
+
+class OutputContractFailureComputation(FakeComputation):
+    def __init__(self):
+        super().__init__(StageStatus.PAUSED)
+
+    def run(self, layout, source, *, input_files=(), deterministic_seed=0, attempt=0,
+            cancel_event=None, expected_outputs=(), input_hashes=None):
+        if attempt == 0:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': True, 'exit_code': 0,
+                                      'blocked_reason': 'declared CSV/PNG output validation failed',
+                                      'failure_summary': ExecutionFailureSummary(
+                                          'OutputValidationError', None, None)})
+        self.status = StageStatus.COMPLETED
+        return super().run(layout, source, input_files=input_files,
+                           deterministic_seed=deterministic_seed, attempt=attempt,
+                           cancel_event=cancel_event, expected_outputs=expected_outputs,
+                           input_hashes=input_hashes)
+
+
+class TwoFailuresThenSuccessComputation(FakeComputation):
+    def __init__(self):
+        super().__init__(StageStatus.PAUSED)
+
+    def run(self, layout, source, *, input_files=(), deterministic_seed=0, attempt=0,
+            cancel_event=None, expected_outputs=(), input_hashes=None):
+        if attempt < 2:
+            result = super().run(layout, source, input_files=input_files,
+                                 deterministic_seed=deterministic_seed, attempt=attempt,
+                                 cancel_event=cancel_event, expected_outputs=expected_outputs,
+                                 input_hashes=input_hashes)
+            return SimpleNamespace(**{**vars(result), 'stage_status': StageStatus.PAUSED,
+                                      'execution_started': True, 'exit_code': 1,
+                                      'blocked_reason': 'controlled generated-code failure',
+                                      'failure_summary': ExecutionFailureSummary(
+                                          'NameError', 200 + attempt, 'missing_value')})
+        self.status = StageStatus.COMPLETED
+        return super().run(layout, source, input_files=input_files,
+                           deterministic_seed=deterministic_seed, attempt=attempt,
+                           cancel_event=cancel_event, expected_outputs=expected_outputs,
+                           input_hashes=input_hashes)
+
+
+class RepairingProvider(FakeProvider):
+    def __init__(self, *, alter_outputs=False):
+        super().__init__()
+        self.alter_outputs = alter_outputs
+
+    def generate(self, context, prompt, cancel_event=None):
+        if context.stage is Stage.CODE_GENERATION and context.attempt == 1:
+            self.calls.append((context.stage, prompt, cancel_event))
+            outputs = [{'name': 'metrics.csv', 'kind': 'table', 'columns': ['指标', '数值'], 'rows': 1},
+                       {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]
+            if self.alter_outputs:
+                outputs[0]['name'] = 'unexpected.csv'
+            return json.dumps({'source': 'print("repaired")\n', 'outputs': outputs}, ensure_ascii=False)
+        return super().generate(context, prompt, cancel_event=cancel_event)
 
 
 class LiveWorkflowTests(unittest.TestCase):
@@ -360,12 +508,190 @@ class LiveWorkflowTests(unittest.TestCase):
         self.assertEqual(Stage.CALCULATION, state.next_stage)
         self.assertNotIn(Stage.PAPER_DRAFTING, [call[0] for call in self.provider.calls])
 
+    def test_generated_code_failure_gets_one_bounded_repair_and_finishes_workflow(self):
+        provider = RepairingProvider()
+        runner = FailOnceComputation()
+
+        state = self.start(self.engine(provider_client=provider, computation_runner=runner))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        code_calls = [(stage, prompt) for stage, prompt, _ in provider.calls
+                      if stage is Stage.CODE_GENERATION]
+        self.assertEqual(2, len(code_calls))
+        self.assertIn('NameError', code_calls[1][1])
+        self.assertIn('R_ARE', code_calls[1][1])
+        self.assertIn('"authorized_problem":null', code_calls[1][1])
+        self.assertNotIn('拟合观测并报告有限误差', code_calls[1][1])
+        self.assertEqual([0, 1], [call[3] for call in runner.calls])
+        self.assertEqual('print("repaired")\n', runner.calls[1][0])
+        run_root = self.project_root / self.run.relative_path
+        original = next(item for item in state.artifacts
+                        if item.stage is Stage.CODE_GENERATION and item.kind == 'script')
+        self.assertEqual(b'# generated only; test runner never executes this\n',
+                         (self.project_root / original.relative_path).read_bytes())
+        repaired = [item for item in state.artifacts
+                    if item.stage is Stage.CALCULATION and item.kind == 'script'
+                    and Path(item.relative_path).name.startswith('generated-repair-')]
+        self.assertEqual(1, len(repaired))
+        self.assertEqual('generated-repair-v0001.py', Path(repaired[0].relative_path).name)
+        calculation = next(item for item in state.artifacts
+                           if item.stage is Stage.CALCULATION
+                           and Path(item.relative_path).name == 'calculation.json')
+        manifest = json.loads((self.project_root / calculation.relative_path).read_text('utf-8'))
+        self.assertTrue(manifest['repair_attempted'])
+        self.assertEqual(1, manifest['calculation_attempt'])
+        self.assertTrue((run_root / '40_results/execution-v0001.json').is_file())
+        self.assertTrue((run_root / '40_results/execution-v0002.json').is_file())
+
+    def test_output_contract_failure_gets_one_bounded_repair(self):
+        provider = RepairingProvider()
+        runner = OutputContractFailureComputation()
+
+        state = self.start(self.engine(provider_client=provider, computation_runner=runner))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        self.assertEqual([0, 1], [call[3] for call in runner.calls])
+        code_calls = [prompt for stage, prompt, _ in provider.calls if stage is Stage.CODE_GENERATION]
+        self.assertEqual(2, len(code_calls))
+        self.assertIn('OutputValidationError', code_calls[1])
+
+    def test_two_distinct_execution_failures_can_be_repaired_before_workflow_continues(self):
+        provider = RepairingProvider()
+        runner = TwoFailuresThenSuccessComputation()
+
+        state = self.start(self.engine(provider_client=provider, computation_runner=runner))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        self.assertEqual([0, 1, 2], [call[3] for call in runner.calls])
+        code_calls = [prompt for stage, prompt, _ in provider.calls
+                      if stage is Stage.CODE_GENERATION]
+        self.assertEqual(3, len(code_calls))
+        self.assertIn('NameError', code_calls[1])
+        self.assertIn('NameError', code_calls[2])
+        repaired = [item for item in state.artifacts
+                    if item.stage is Stage.CALCULATION and item.kind == 'script'
+                    and Path(item.relative_path).name.startswith('generated-repair-')]
+        self.assertEqual({'generated-repair-v0001.py', 'generated-repair-v0002.py'},
+                         {Path(item.relative_path).name for item in repaired})
+        calculation = next(item for item in state.artifacts
+                           if item.stage is Stage.CALCULATION
+                           and Path(item.relative_path).name == 'calculation.json')
+        manifest = json.loads((self.project_root / calculation.relative_path).read_text('utf-8'))
+        self.assertEqual(2, manifest['repair_attempt_count'])
+
+    def test_two_failed_repairs_stop_and_are_not_requested_again_after_user_resumes(self):
+        provider = RepairingProvider()
+        runner = FailOnceComputation(fail_after_repair=True)
+        engine = self.engine(provider_client=provider, computation_runner=runner)
+
+        state = self.start(engine)
+        self.assertEqual(RunStatus.PAUSED, state.status)
+        self.assertTrue(any(item.stage is Stage.CALCULATION and item.kind == 'script'
+                            for item in state.artifacts))
+        calls_after_failure = len(provider.calls)
+
+        resumed = engine.resume(self.run.run_id, self.sources, self.selected)
+
+        self.assertEqual(RunStatus.PAUSED, resumed.status)
+        self.assertEqual(calls_after_failure, len(provider.calls))
+        self.assertEqual(3, len(runner.calls))
+        self.assertEqual(3, len([call for call in provider.calls
+                                 if call[0] is Stage.CODE_GENERATION]))
+        calculation = next(item for item in state.artifacts
+                           if item.stage is Stage.CALCULATION
+                           and Path(item.relative_path).name == 'calculation.json')
+        manifest = json.loads((self.project_root / calculation.relative_path).read_text('utf-8'))
+        self.assertEqual(2, manifest['repair_attempt_count'])
+
+    def test_legacy_paused_calculation_resumes_then_repairs_once(self):
+        provider = RepairingProvider()
+        runner = LegacyFailureThenDetailComputation()
+        engine = self.engine(provider_client=provider, computation_runner=runner)
+
+        paused = self.start(engine)
+        self.assertEqual(RunStatus.PAUSED, paused.status)
+        self.assertEqual(1, len([call for call in provider.calls if call[0] is Stage.CODE_GENERATION]))
+
+        completed = engine.resume(self.run.run_id, self.sources, self.selected)
+
+        self.assertEqual(RunStatus.COMPLETED, completed.status, completed.diagnostics)
+        self.assertEqual([0, 1, 2], [call[3] for call in runner.calls])
+        self.assertEqual(2, len([call for call in provider.calls if call[0] is Stage.CODE_GENERATION]))
+
+    def test_preflight_pause_can_resume_then_repair_after_a_later_execution_attempt(self):
+        provider = RepairingProvider()
+        runner = PreflightThenFailureComputation()
+        engine = self.engine(provider_client=provider, computation_runner=runner)
+
+        first_pause = self.start(engine)
+        second_pause = engine.resume(self.run.run_id, self.sources, self.selected)
+        self.assertEqual(RunStatus.PAUSED, first_pause.status)
+        self.assertEqual(RunStatus.PAUSED, second_pause.status)
+
+        completed = engine.resume(self.run.run_id, self.sources, self.selected)
+
+        self.assertEqual(RunStatus.COMPLETED, completed.status, completed.diagnostics)
+        self.assertEqual([0, 1, 2, 3], [call[3] for call in runner.calls])
+        self.assertEqual(2, len([call for call in provider.calls if call[0] is Stage.CODE_GENERATION]))
+
+    def test_repair_cannot_change_declared_output_plan(self):
+        provider = RepairingProvider(alter_outputs=True)
+        runner = FailOnceComputation()
+        engine = self.engine(provider_client=provider, computation_runner=runner)
+
+        state = self.start(engine)
+
+        self.assertEqual(RunStatus.PAUSED, state.status)
+        self.assertEqual(1, len(runner.calls))
+        self.assertNotIn(Stage.PAPER_DRAFTING, [call[0] for call in provider.calls])
+        calculation = next(item for item in state.artifacts
+                           if item.stage is Stage.CALCULATION
+                           and Path(item.relative_path).name == 'calculation.json')
+        manifest = json.loads((self.project_root / calculation.relative_path).read_text('utf-8'))
+        self.assertTrue(manifest['repair_attempted'])
+
     def test_invalid_result_pauses_before_prose(self):
         state = self.start(self.engine(computation_runner=FakeComputation(corrupt=True)))
         self.assertEqual(RunStatus.PAUSED, state.status)
         self.assertEqual(PauseReason.VALIDATION_FAILED, state.pause_reason)
         self.assertEqual(Stage.RESULT_VALIDATION, state.next_stage)
         self.assertNotIn(Stage.PAPER_DRAFTING, [call[0] for call in self.provider.calls])
+
+    def test_paper_structure_gets_one_correction_without_replaying_raw_response(self):
+        class PaperProvider(FakeProvider):
+            def generate(self, context, prompt, cancel_event=None):
+                raw = super().generate(context, prompt, cancel_event=cancel_event)
+                if context.stage is Stage.PAPER_DRAFTING:
+                    calls = [call for call in self.calls if call[0] is Stage.PAPER_DRAFTING]
+                    if len(calls) == 1:
+                        value = json.loads(raw)
+                        value['sections'][0]['paragraphs'] = ['private-draft-response-marker']
+                        value['figures'][0]['section_key'] = value['sections'][0]['section_key']
+                        return json.dumps(value)
+                return raw
+
+        provider = PaperProvider()
+        state = self.start(self.engine(provider_client=provider))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        prompts = [prompt for stage, prompt, _ in provider.calls if stage is Stage.PAPER_DRAFTING]
+        self.assertEqual(2, len(prompts))
+        self.assertIn('paper_contract', prompts[1])
+        self.assertNotIn('private-draft-response-marker', prompts[1])
+
+    def test_explanatory_paper_text_may_have_an_empty_evidence_list(self):
+        class PaperProvider(FakeProvider):
+            def generate(self, context, prompt, cancel_event=None):
+                raw = super().generate(context, prompt, cancel_event=cancel_event)
+                if context.stage is Stage.PAPER_DRAFTING:
+                    value = json.loads(raw)
+                    value['sections'][0]['evidence_ids'] = []
+                    return json.dumps(value)
+                return raw
+
+        state = self.start(self.engine(provider_client=PaperProvider()))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
 
     def test_sandbox_shutdown_warning_survives_workflow_pause(self):
         runner = FakeComputation(StageStatus.PAUSED)
@@ -402,6 +728,44 @@ class LiveWorkflowTests(unittest.TestCase):
         self.assertNotIn('SECRET-DO-NOT-LOG', ''.join(state.diagnostics))
         self.assertFalse(self.runner.calls)
 
+    def test_json_syntax_error_gets_one_format_repair_request_and_workflow_completes(self):
+        class RepairingProvider(FakeProvider):
+            def generate(inner_self, context, prompt, cancel_event=None):
+                if context.stage is Stage.CODE_GENERATION:
+                    prior_calls = sum(stage is Stage.CODE_GENERATION
+                                      for stage, _, _ in inner_self.calls)
+                    if prior_calls == 0:
+                        inner_self.calls.append((context.stage, prompt, cancel_event))
+                        return '{"source":'
+                return super(RepairingProvider, inner_self).generate(
+                    context, prompt, cancel_event=cancel_event)
+
+        provider = RepairingProvider()
+        events = []
+        state = self.start(self.engine(provider_client=provider),
+                           progress=RunProgressReporter(self.run.run_id, events.append))
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        generation_calls = [prompt for stage, prompt, _ in provider.calls
+                            if stage is Stage.CODE_GENERATION]
+        self.assertEqual(2, len(generation_calls))
+        self.assertIn('上一次响应未通过 JSON 语法或结构验证', generation_calls[1])
+        self.assertTrue(any(event.kind is ProgressKind.STAGE_PROGRESS
+                            and '格式纠正重试' in event.title for event in events))
+        self.assertEqual(1, len(self.runner.calls))
+
+    def test_invalid_json_after_format_repair_pauses_without_execution(self):
+        provider = FakeProvider({Stage.CODE_GENERATION: '{"source":'})
+
+        state = self.start(self.engine(provider_client=provider))
+
+        self.assertEqual(RunStatus.PAUSED, state.status)
+        self.assertEqual(Stage.CODE_GENERATION, state.next_stage)
+        self.assertIn('格式纠正重试仍失败', ''.join(state.diagnostics))
+        self.assertEqual(2, sum(stage is Stage.CODE_GENERATION
+                                for stage, _, _ in provider.calls))
+        self.assertFalse(self.runner.calls)
+
     def test_output_names_cannot_escape_run(self):
         provider = FakeProvider({Stage.CODE_GENERATION: {'source': 'pass', 'outputs': [
             {'name': '../escape.csv', 'kind': 'table', 'columns': ['x'], 'rows': 1}]}})
@@ -413,8 +777,50 @@ class LiveWorkflowTests(unittest.TestCase):
     def test_missing_template_or_confirmed_mapping_pauses_before_prose(self):
         state = self.start(self.engine(template_mapping=None))
         self.assertEqual(RunStatus.PAUSED, state.status)
+        self.assertEqual(Stage.PREFLIGHT, state.next_stage)
         self.assertEqual(PauseReason.UNSUPPORTED_TEMPLATE, state.pause_reason)
+        self.assertFalse(self.provider.calls)
+        self.assertFalse(self.runner.calls)
         self.assertNotIn(Stage.PAPER_DRAFTING, [call[0] for call in self.provider.calls])
+
+    def test_saved_template_mapping_is_reloaded_when_resuming_a_project(self):
+        self.mapping.save(self.project_root)
+        state = self.start(self.engine(template_mapping=None))
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+
+    def test_run_without_selected_template_generates_editable_generic_word(self):
+        selected = tuple(item.source_id for item in self.sources if item.kind != 'docx')
+        state = self.engine(template_mapping=None).start(
+            self.project.project_id, self.run.run_id, self.sources, selected)
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        paper = next(item for item in state.artifacts if item.kind == 'paper')
+        paper_path = self.project_root / paper.relative_path
+        with ZipFile(paper_path) as archive:
+            document = archive.read('word/document.xml').decode('utf-8')
+        self.assertIn('基于本次有限结果', document)
+        self.assertIn('results table', document)
+
+    def test_paper_drafting_removes_xml_forbidden_controls_from_model_text(self):
+        class XmlControlCharacterProvider(FakeProvider):
+            def generate(self, context, prompt, cancel_event=None):
+                raw = super().generate(context, prompt, cancel_event=cancel_event)
+                if context.stage is Stage.PAPER_DRAFTING:
+                    value = json.loads(raw)
+                    value['sections'][0]['paragraphs'][0] = '保留前文\x01保留后文'
+                    return json.dumps(value, ensure_ascii=False)
+                return raw
+
+        provider = XmlControlCharacterProvider()
+        selected = tuple(item.source_id for item in self.sources if item.kind != 'docx')
+        state = self.engine(provider_client=provider).start(
+            self.project.project_id, self.run.run_id, self.sources, selected)
+
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        paper = next(item for item in state.artifacts if item.kind == 'paper')
+        with ZipFile(self.project_root / paper.relative_path) as archive:
+            document = archive.read('word/document.xml').decode('utf-8')
+        self.assertIn('保留前文保留后文', document)
+        self.assertNotIn('\x01', document)
 
     def test_missing_selected_data_pauses_without_generation(self):
         selected = tuple(item.source_id for item in self.sources if item.kind != 'csv')
@@ -512,12 +918,11 @@ class LiveWorkflowTests(unittest.TestCase):
         self.assertEqual(Stage.CODE_GENERATION, state.next_stage)
         self.assertFalse(self.runner.calls)
 
-    def test_missing_selected_template_is_explicit_pause(self):
+    def test_missing_selected_template_uses_builtin_word_layout(self):
         selected = tuple(item.source_id for item in self.sources if item.kind != 'docx')
         state = self.engine().start(self.project.project_id, self.run.run_id, self.sources, selected)
-        self.assertEqual(RunStatus.PAUSED, state.status)
-        self.assertEqual(PauseReason.UNSUPPORTED_TEMPLATE, state.pause_reason)
-        self.assertNotIn(Stage.PAPER_DRAFTING, [call[0] for call in self.provider.calls])
+        self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
+        self.assertTrue(any(item.kind == 'paper' for item in state.artifacts))
 
     def test_changed_external_result_prevents_checkpoint_recovery(self):
         from mathmodel_paper_studio.workflow.checkpoint import CheckpointRecoveryError

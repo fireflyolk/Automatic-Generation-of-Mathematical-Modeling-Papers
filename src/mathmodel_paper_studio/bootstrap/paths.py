@@ -81,6 +81,20 @@ def validate_managed_path(value: str | os.PathLike) -> Path:
     return path
 
 
+def validate_application_resource_path(value: str | os.PathLike) -> Path:
+    """Allow read-only installed resources; writable app storage stays F:-only."""
+    path = _absolute_local_path(value)
+    if path.drive.casefold() == 'f:':
+        return validate_managed_path(path)
+    local_app_data = os.environ.get('LOCALAPPDATA', '')
+    installation = _absolute_local_path(local_app_data) / 'Programs' / 'MathModelPaperStudio'
+    if (path.drive.casefold() != 'c:' or installation.drive.casefold() != 'c:'
+            or not path.is_relative_to(installation)):
+        raise PathPolicyError('应用资源必须位于批准的 C: 安装目录或 F: 工作目录内。')
+    _reject_reparse_components(path, '安装资源')
+    return path
+
+
 @dataclass(frozen=True)
 class AppPaths:
     root: Path = Path(DEFAULT_ROOT)

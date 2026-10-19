@@ -38,6 +38,42 @@ def _sha256(path: Path) -> str:
 class WindowsSandboxLiveAcceptanceTests(unittest.TestCase):
     """Exercises process isolation, offline execution, runtime imports, and artifacts."""
 
+    def test_generated_failure_is_returned_through_the_shared_result_record(self):
+        runtime_root = Path(os.environ.get("MMPS_COMPUTATION_RUNTIME_ROOT", RUNTIME_DEFAULT))
+        executor = WindowsSandboxExecutor(runtime_root)
+        available, reason = executor.available()
+        self.assertTrue(available, reason)
+        task_root = F_WORKSPACE / "tmp" / f"windows-sandbox-failure-{uuid4().hex[:12]}"
+        paths = AppPaths(task_root / "app")
+        paths.ensure_directories()
+        suffix = uuid4().hex[:8]
+        project = Project(f"failure{suffix}", "沙盒错误回传验收", f"projects/failure{suffix}")
+        project_root = paths.root / project.relative_path
+        project_root.mkdir(parents=True)
+        (project_root / "00_inputs").mkdir()
+        (project_root / "90_runs").mkdir()
+        run = Run(f"run{suffix}", project.project_id, Provider.CODEX,
+                  RunStatus.CREATED, f"90_runs/run{suffix}")
+        layout = RunArtifactLayout.create(paths, project, run)
+        source_csv = project_root / "00_inputs" / "synthetic.csv"
+        source_csv.write_text("x\n1\n", encoding="utf-8")
+
+        outcome = PythonRunner(executor=executor).run(
+            layout, "print(MISSING_RESULT_PROBE)\n", input_files=(source_csv,),
+            expected_outputs=(ArtifactExpectation("40_results/result.csv", "table"),),
+        )
+
+        self.assertEqual(StageStatus.PAUSED, outcome.stage_status)
+        self.assertTrue(outcome.execution_started)
+        self.assertEqual(1, outcome.exit_code, outcome.blocked_reason)
+        self.assertEqual("NameError", outcome.failure_summary.error_type)
+        self.assertEqual(1, outcome.failure_summary.line)
+        self.assertEqual("MISSING_RESULT_PROBE", outcome.failure_summary.name)
+        self.assertFalse((layout.results_dir / ".mmps-execution-result.json").exists())
+        summary = json.loads(outcome.summary_path.read_text("utf-8"))
+        self.assertEqual("NameError", summary["failure_summary"]["error_type"])
+        self.assertNotIn("Traceback", json.dumps(summary))
+
     def test_generated_calculation_runs_only_in_sandbox_and_returns_valid_artifacts(self):
         runtime_root = Path(os.environ.get("MMPS_COMPUTATION_RUNTIME_ROOT", RUNTIME_DEFAULT))
         executor = WindowsSandboxExecutor(runtime_root)

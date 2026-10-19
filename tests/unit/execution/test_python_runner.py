@@ -7,8 +7,11 @@ import unittest
 from mathmodel_paper_studio.agents.preflight import Provider
 from mathmodel_paper_studio.bootstrap.paths import APPROVED_BASE, AppPaths
 from mathmodel_paper_studio.domain.models import Project, Run, RunStatus, StageStatus
+from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
 from mathmodel_paper_studio.execution.limits import ComputationLimits
 from mathmodel_paper_studio.execution.python_runner import PythonRunner, RunArtifactLayout
+from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
+from mathmodel_paper_studio.execution.windows_sandbox import SandboxExecutionResult
 
 ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
 
@@ -59,6 +62,28 @@ class ComputationLimitsTests(unittest.TestCase):
 
 
 class PythonRunnerTests(unittest.TestCase):
+    def test_sanitized_failure_summary_is_saved_without_raw_stderr(self):
+        _, _, _, layout = make_layout(self)
+        failure = ExecutionFailureSummary('NameError', 233, 'R_ARE')
+
+        class FailedExecutor:
+            def execute(self, *_args, **_kwargs):
+                return SandboxExecutionResult(
+                    StageStatus.PAUSED, True,
+                    '沙盒中的计算程序返回失败状态。 ' + failure.display_text(),
+                    ('wsb', 'exec'), 'sandbox:python.exe', 'fingerprint', 1,
+                    failure_summary=failure,
+                )
+
+        outcome = PythonRunner(executor=FailedExecutor()).run(
+            layout, 'print(R_ARE)\n', expected_outputs=(ArtifactExpectation('40_results/a.csv', 'table'),),
+        )
+
+        self.assertEqual(failure, outcome.failure_summary)
+        summary = json.loads(outcome.summary_path.read_text('utf-8'))
+        self.assertEqual(failure.to_dict(), summary['failure_summary'])
+        self.assertNotIn('Traceback', outcome.blocked_reason)
+
     def test_generated_source_is_saved_but_execution_pauses_fail_closed(self):
         _, _, _, layout = make_layout(self)
         source = "print('must never execute')\n"

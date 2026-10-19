@@ -58,6 +58,7 @@ $verifier = Get-ValidatedFPath $verifier -RequireFile
 $runtimePython = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'python.exe') -RequireFile
 $runtimeManifest = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'runtime-manifest.json') -RequireFile
 $runtimeEntry = Get-ValidatedFPath (Join-Path $ComputationRuntimeRoot 'sandbox_entry.py') -RequireFile
+$sourceRuntimeEntry = Get-ValidatedFPath (Join-Path $projectRoot 'packaging\runtime\sandbox_entry.py') -RequireFile
 if (!(Test-Path -LiteralPath $ComputationRuntimeRoot -PathType Container)) {
     throw 'The locked F: computation runtime directory is missing.'
 }
@@ -65,6 +66,8 @@ $env:PYTHONPATH = Join-Path $projectRoot 'src'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 & $pythonPath -B -c "import sys; from mathmodel_paper_studio.bootstrap.paths import validate_managed_path; tuple(validate_managed_path(p) for p in sys.argv[1:])" $projectRoot $BuildRoot $OutputRoot $taskTemp $pythonPath
 if ($LASTEXITCODE -ne 0) { throw 'Physical F: path validation failed before creating outputs.' }
+& $pythonPath -B $verifier --runtime-entry $runtimeEntry --source-runtime-entry $sourceRuntimeEntry
+if ($LASTEXITCODE -ne 0) { throw 'Computation runtime Sandbox launcher does not match the current host protocol.' }
 [void][IO.Directory]::CreateDirectory($taskTemp)
 $env:TEMP = $taskTemp
 $env:TMP = $taskTemp
@@ -106,6 +109,9 @@ try {
     & (Join-Path $packageRuntime 'python.exe') -B $verifier --inventory-root $packageRuntime `
         --trusted-runtime-lock (Join-Path $projectRoot 'requirements-execution.lock') --report $runtimeInventory
     if ($LASTEXITCODE -ne 0) { throw 'Bundled computation runtime inventory/lock verification failed.' }
+    $packageRuntimeEntry = Get-ValidatedFPath (Join-Path $packageRuntime 'sandbox_entry.py') -RequireFile
+    & $pythonPath -B $verifier --runtime-entry $packageRuntimeEntry --source-runtime-entry $sourceRuntimeEntry
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled Sandbox launcher does not match the current host protocol.' }
     & $pythonPath -B $verifier --inventory-root $packageRoot --report (Join-Path $OutputRoot 'package-files.json')
     if ($LASTEXITCODE -ne 0) { throw 'Package path/secret scan failed.' }
     & $pythonPath -B $verifier --archive (Join-Path $packageRoot 'MathModelPaperStudio.exe') --report (Join-Path $OutputRoot 'archive-members.json')

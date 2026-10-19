@@ -1,0 +1,31 @@
+# 2026-10-19 桌面版暂停问题修复与验收
+
+## 交付
+
+- 桌面版快捷方式所指目录已原位替换为修复包：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-pdf-20261018\release-v2\MathModelPaperStudio`。
+- 已保留旧版目录备份：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-repair-20261019\desktop-release-before-complete\MathModelPaperStudio`。
+- 新版 EXE SHA-256：`D5F6071D28B024F15879551954AE318FBDAB6D45C4406DEA8BE3E318EA35960B`。
+- 沙箱运行入口 SHA-256：`F32381C87A8A4E6D923B97B5B7081A8A0263CEEA65B1EC1EB4438882952DAE4F`。
+- 新版和部署后目录均按发布清单核对了 7,910 个文件；部署后的冻结启动检查退出码为 0，报告 `status=ok`、`frozen=true`，9 个受管路径都位于 F 盘。桌面 GUI 已启动，窗口标题“数模论文工作台”，进程仍在运行并响应。
+
+## 本次运行
+
+本地项目运行已验收（项目 <project-id>，运行 <run-id>）。
+
+产物：projects/<project-id>/90_runs/<run-id>/60_paper/paper-v0001.docx；内容哈希：已在本地校验，具体值不公开。
+
+DOCX 包结构检查通过：没有损坏关系、缺失章节/图表/证据或未替换占位符。用 LibreOffice 导出 16 页 PDF 并逐页渲染为 PNG 后目视检查，没有空白页或明显裁切。论文仍是待人工审阅的草稿：标题和人工复核标记保留；模型、假设、结论和证据关联需要核实；数学正确性未验证；本次使用软件内置模板，没有验收用户自定义模板。计算示例中的几何图是合成示意，不代表真实性能结论。
+
+## 修复与验证
+
+重复暂停的主要技术原因是 Windows Sandbox CLI 的 `wsb exec --raw` 不转发被启动进程的标准输入输出；旧适配器把 CLI 自身返回码当成了客户计算进程的结果。现在可信沙箱入口在映射输出目录写入受限执行结果记录，宿主机在停止沙箱后读取并严格校验子进程退出状态，再核对声明的产物。CLI 行为见 [Microsoft Windows Sandbox CLI 文档](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli)。
+
+结果通道接通后，真实运行暴露出生成代码中的 `R_ARE` 名称错误，修复后计算成功。Agent JSON 响应和代码修复请求均设置了有限重试上限，重复违反协议或执行失败时会安全暂停并显示原因，不会无限自动重试。
+
+- 定向测试：118 passed，另有 38 个子测试通过。
+- 真实 Windows Sandbox 集成测试：2 passed，包括计算成功和子进程异常状态传回。
+- 沙箱恢复记录与临时沙箱目录：运行后均为 0。
+
+## 证据边界
+
+完整的 9 阶段用户项目运行由当前源码中的 `LiveWorkflowEngine` 执行，并写入应用使用的数据目录；修复后的打包 EXE 已做冻结启动检查并实际打开，窗口保持响应。没有通过打包 GUI 的“同意范围并开始”按钮重新触发这次运行，因此不把这次记录描述成一次由打包 UI 点击触发的运行。后续任意 Agent 输出仍受服务可用性、额度和响应格式影响；本次项目的运行已完成，但论文内容仍需人工审阅。

@@ -10,6 +10,8 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 import xml.etree.ElementTree as ET
 
+from docx import Document
+from docx.shared import Cm, Pt
 from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
@@ -46,10 +48,21 @@ class DocxWriteError(ValueError):
 
 
 def _text(value: str, *, allow_empty: bool = False) -> str:
-    if (not isinstance(value, str) or len(value) > _MAX_TEXT_CHARS or '\x00' in value
-            or (not allow_empty and not value.strip())):
+    if not isinstance(value, str) or len(value) > _MAX_TEXT_CHARS:
         raise DocxWriteError('Document text is empty, invalid, or exceeds its size limit.')
-    return value
+    # Model and imported table text can contain XML 1.0-forbidden code points.
+    # Remove those before writing OOXML so one bad character cannot pause the
+    # paper stage after the Agent has already returned a valid draft.
+    compatible = ''.join(
+        character for character in value
+        if ord(character) in (0x09, 0x0A, 0x0D)
+        or 0x20 <= ord(character) <= 0xD7FF
+        or 0xE000 <= ord(character) <= 0xFFFD
+        or 0x10000 <= ord(character) <= 0x10FFFF
+    )
+    if not allow_empty and not compatible.strip():
+        raise DocxWriteError('Document text is empty, invalid, or exceeds its size limit.')
+    return compatible
 
 
 def _evidence_ids(values) -> tuple[str, ...]:
@@ -164,6 +177,115 @@ class DocxWriteResult:
     source_sha256: str
     version: int
     modified_parts: tuple[str, ...]
+
+
+_GENERIC_SECTION_TITLES = {
+    'abstract': '摘要', 'problem_restatement': '问题重述', 'assumptions': '模型假设',
+    'notation': '符号说明', 'model': '模型建立', 'solution': '求解与分析',
+    'verification': '模型检验', 'conclusion': '结论', 'references': '参考文献',
+}
+
+
+def _generic_section_title(section_key: str) -> str:
+    return _GENERIC_SECTION_TITLES.get(section_key, section_key.replace('_', ' '))
+
+
+def _generic_document_bytes(draft: PaperDraft) -> bytes:
+    document = Document()
+    section = document.sections[0]
+    section.page_width, section.page_height = Cm(21), Cm(29.7)
+    section.top_margin = section.bottom_margin = Cm(2.54)
+    section.left_margin = section.right_margin = Cm(2.54)
+    normal = document.styles['Normal']
+    normal.font.name = '宋体'
+    normal.font.size = Pt(11)
+    document.add_heading('数学建模论文（待补标题）', level=0)
+    document.add_paragraph('可编辑草稿；模型、数据解释与结论需人工复核。')
+
+    for item in draft.sections:
+        document.add_heading(_generic_section_title(item.section_key), level=1)
+        document.add_paragraph('{{section:' + item.section_key + '}}')
+    for item in draft.tables:
+        document.add_paragraph('表：' + _generic_section_title(item.section_key))
+        table = document.add_table(rows=1, cols=len(item.headers))
+        table.style = 'Table Grid'
+        for index, cell in enumerate(table.rows[0].cells):
+            cell.text = '{{table:' + item.section_key + ':' + str(index) + '}}'
+    for item in draft.figures:
+        document.add_heading(_generic_section_title(item.section_key), level=1)
+
+    package = BytesIO()
+    try:
+        document.save(package)
+    except (OSError, ValueError, TypeError) as exc:
+        raise DocxWriteError('Built-in Word document could not be assembled.') from exc
+    content = package.getvalue()
+    if not content or len(content) > _MAX_PACKAGE_BYTES:
+        raise DocxWriteError('Built-in Word document is empty or exceeds the package limit.')
+    return content
+
+
+def _save_generic_template(output_directory: Path, content: bytes) -> Path:
+    template_path = None
+    for version in range(1, 10000):
+        destination = validate_managed_path(
+            output_directory / f'.builtin-template-v{version:04d}.docx')
+        if destination.exists():
+            continue
+        temporary = validate_managed_path(
+            output_directory / f'.builtin-template-v{version:04d}.{uuid4().hex}.tmp')
+        try:
+            with temporary.open('xb') as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            validate_managed_path(temporary)
+            validate_managed_path(destination)
+            if destination.exists():
+                temporary.unlink()
+                continue
+            temporary.rename(destination)
+            template_path = validate_managed_path(destination)
+            break
+        except FileExistsError:
+            if temporary.exists():
+                temporary.unlink()
+        except BaseException:
+            if temporary.exists():
+                validate_managed_path(temporary)
+                temporary.unlink()
+            raise
+    if template_path is None:
+        raise DocxWriteError('No free built-in Word template version remains.')
+    return template_path
+
+
+def _generic_template_mapping(template_path: Path, draft: PaperDraft):
+    inspection = inspect_template(template_path)
+    headings = iter(item for item in inspection.anchors if item.kind == 'heading')
+    tables = iter(item for item in inspection.anchors if item.kind == 'table')
+    selections = {}
+    try:
+        for item in (*draft.sections, *draft.figures):
+            selections[item.section_key] = next(headings).anchor_id
+        for item in draft.tables:
+            selections[item.section_key] = next(tables).anchor_id
+    except StopIteration as exc:
+        raise DocxWriteError('Built-in Word anchors do not match the generated draft.') from exc
+    mapping = TemplateMapping.from_selection(inspection, selections)
+    mapping.validate_for(inspection)
+    return template_path, inspection, mapping
+
+
+def write_generic_template(output_directory: Path, draft: PaperDraft):
+    """Create a fresh editable Word skeleton and its app-owned anchor mapping."""
+    if not isinstance(draft, PaperDraft):
+        raise DocxWriteError('Paper draft type is invalid.')
+    output_directory = validate_managed_path(Path(output_directory))
+    if not output_directory.is_dir():
+        raise DocxWriteError('Generic Word output directory is unavailable.')
+    template_path = _save_generic_template(output_directory, _generic_document_bytes(draft))
+    return _generic_template_mapping(template_path, draft)
 
 
 def _safe_parse(content: bytes, part: str):

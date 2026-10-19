@@ -18,6 +18,7 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_pa
 from mathmodel_paper_studio.domain.models import (
     ArtifactEvidence, Project, Run, StageStatus, relative_path as validate_relative_path,
 )
+from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
 from mathmodel_paper_studio.execution.limits import ComputationLimits
 
 
@@ -188,6 +189,7 @@ class ComputationOutcome:
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     artifacts: tuple[ArtifactEvidence, ...] = ()
+    failure_summary: ExecutionFailureSummary | None = None
 
 
 class PythonRunner:
@@ -278,6 +280,7 @@ class PythonRunner:
         dependency_fingerprint = None
         exit_code = None
         artifacts = ()
+        failure_summary = None
         if not cancelled and self.executor is not None:
             from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
             if (not expected_outputs or any(not isinstance(item, ArtifactExpectation)
@@ -301,6 +304,11 @@ class PythonRunner:
                 dependency_fingerprint = result.dependency_fingerprint
                 exit_code = result.exit_code
                 artifacts = tuple(result.artifacts)
+                candidate_failure = getattr(result, 'failure_summary', None)
+                if candidate_failure is not None:
+                    if not isinstance(candidate_failure, ExecutionFailureSummary):
+                        raise ValueError('计算后端错误摘要类型无效。')
+                    failure_summary = candidate_failure
         summary = {
             'schema_version': 1,
             'run_id': layout.run.run_id,
@@ -317,6 +325,7 @@ class PythonRunner:
             'dependency_fingerprint': dependency_fingerprint,
             'command': list(command),
             'exit_code': exit_code,
+            'failure_summary': None if failure_summary is None else failure_summary.to_dict(),
             'stdout_path': None,
             'stderr_path': None,
             'resource_limits': asdict(self.limits),
@@ -326,7 +335,8 @@ class PythonRunner:
         summary_evidence = _evidence(layout, summary_relative, 'validation', summary_path)
         return ComputationOutcome(status, execution_started, reason, deterministic_seed, script_path, summary_path,
                                   script_evidence, summary_evidence, command, interpreter,
-                                  dependency_fingerprint, exit_code, None, None, artifacts)
+                                  dependency_fingerprint, exit_code, None, None, artifacts,
+                                  failure_summary)
 
 
 

@@ -155,7 +155,6 @@ class RunReviewModel:
                 '工具与本机权限：无工具调用、文件访问、代码执行或浏览功能。',
                 '费用与外发：点击同意后，请求会发送到 DeepSeek API 并按 token 用量计费；费用取决于实际输入和输出。',
                 '远端连接、API Key 有效性和账户额度尚未验证；首次请求可能失败。',
-                '当前生成代码执行安全门未通过验收；运行会在计算阶段暂停，不会生成最终 Word。',
             ]
         elif status.provider is Provider.CODEX:
             lines[2:2] = [
@@ -170,6 +169,8 @@ class RunReviewModel:
             lines.append('DOCX 数据处理：会提取正文段落和表格文本，作为未信任文本发送给所选 Agent；DOCX 不作为附件上传。')
         if self.docx_template_files:
             lines.append('Word 模板只在本机用于生成和校验文档，不会上传。')
+        lines.append('格式纠正重试：若 Agent 首次回复不是合法 JSON，应用会将相同阶段请求附加固定格式说明后重试一次；可能增加服务用量。')
+        lines.append('计算失败恢复：若 Sandbox 返回受支持的程序错误或输出结构校验失败，应用最多向所选 Agent 发送两次生成代码和筛选后的错误摘要，请求修复后仍在 Sandbox 重跑；可能增加服务用量，不发送原始 stderr。')
         for path in self.readable_files:
             if path in self.docx_data_files:
                 label = 'DOCX 数据：'

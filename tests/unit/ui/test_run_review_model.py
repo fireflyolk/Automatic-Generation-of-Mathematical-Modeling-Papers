@@ -96,6 +96,11 @@ class RunReviewModelTests(unittest.TestCase):
         self.assertIn('不提供项目工作区文件读取、写入、命令或代码执行工具', text)
         self.assertIn('本机 CLI 自身配置和登录凭据', text)
         self.assertIn('附带的账号设置请求', text)
+        self.assertIn('格式纠正重试', text)
+        self.assertIn('若 Sandbox 返回受支持的程序错误或输出结构校验失败', text)
+        self.assertIn('最多向所选 Agent 发送两次生成代码和筛选后的错误摘要', text)
+        self.assertIn('不发送原始 stderr', text)
+        self.assertIn('可能增加服务用量', text)
         self.assertTrue(dialog.start_button.isEnabled())
 
     def test_start_stays_disabled_when_provider_or_scope_preflight_fails(self):

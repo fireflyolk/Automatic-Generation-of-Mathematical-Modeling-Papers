@@ -18,14 +18,15 @@ from mathmodel_paper_studio.agents.protocol import AgentEvent, EventKind
 from mathmodel_paper_studio.agents.deepseek_model_preferences import DeepSeekModelPreference
 from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
 from mathmodel_paper_studio.domain.models import ArtifactEvidence, Stage, StageStatus
+from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
 from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation, ResultValidator
 from mathmodel_paper_studio.paper.docx_qa import run_docx_qa
 from mathmodel_paper_studio.paper.docx_writer import (
-    FigureDraft, PaperDraft, TableDraft, TextSection, write_paper,
+    FigureDraft, PaperDraft, TableDraft, TextSection, write_generic_template, write_paper,
 )
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
-from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
+from mathmodel_paper_studio.paper.template_mapping import TemplateMapping, TemplateMappingError
 from mathmodel_paper_studio.workflow.checkpoint import CheckpointStore
 from mathmodel_paper_studio.workflow.context_builder import ContextBuilder, ContextInputError
 from mathmodel_paper_studio.workflow.engine import WorkflowEngine
@@ -34,7 +35,23 @@ from mathmodel_paper_studio.workflow.stages import ArtifactDigest, PauseReason, 
 
 _MAX_JSON_BYTES = 1024 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+_MAX_CODE_REPAIR_ATTEMPTS = 2
 _HUMAN_REVIEW = '数学模型、假设与科学结论必须由人工复核。'
+_JSON_REPAIR_INSTRUCTION = (
+    '\n上一次响应未通过 JSON 语法或结构验证。请重新回答同一请求，只输出一个完整且合法的 JSON 对象，'
+    '严格符合上方 schema 和阶段 contract；仅使用请求中提供的字段和证据 ID；'
+    '不要输出 Markdown、前言或结尾文本，不要调用工具。'
+)
+
+
+class _AgentResponseFormatError(ValueError):
+    """The provider returned invalid JSON twice, without exposing either response."""
+
+
+class _AgentResponseContractError(ValueError):
+    """A response failed an application-owned shape or evidence validator."""
+
+
 _SCHEMAS = {
     Stage.PROBLEM_DECOMPOSITION: {'subproblems': ['measurable subproblem']},
     Stage.MODEL_PROPOSAL: {'assumptions': ['assumption'], 'variables': ['definition'],
@@ -43,9 +60,9 @@ _SCHEMAS = {
         {'name': 'metrics.csv', 'kind': 'table', 'columns': ['metric', 'value'], 'rows': None},
         {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]},
     Stage.PAPER_DRAFTING: {'sections': [
-        {'section_key': 'confirmed_heading_key', 'paragraphs': ['prose'], 'evidence_ids': ['validated_id']}],
+        {'section_key': 'confirmed_text_heading_key', 'paragraphs': ['prose'], 'evidence_ids': ['validated_id']}],
         'tables': [{'section_key': 'confirmed_table_key', 'evidence_id': 'validated_table_id'}],
-        'figures': [{'section_key': 'confirmed_heading_key', 'evidence_id': 'validated_figure_id', 'caption': 'caption'}]},
+        'figures': [{'section_key': 'confirmed_figure_heading_key', 'evidence_id': 'validated_figure_id', 'caption': 'caption'}]},
 }
 
 
@@ -138,6 +155,16 @@ class LiveWorkflowEngine(WorkflowEngine):
 
     def _drive(self, project, run_id, sources, selected_source_ids, layout, store,
                state, cancel_event, progress=None):
+        template_problem = self._template_prerequisite(
+            layout.project_root, sources, selected_source_ids)
+        if template_problem:
+            result = self._paused(state.next_stage, state.next_attempt,
+                                  PauseReason.UNSUPPORTED_TEMPLATE, template_problem)
+            self._emit_stage_started(progress, result.stage, result.attempt)
+            state = self._commit_result(state, result, (), layout, store)
+            self._emit_stage_result(progress, result, ())
+            self._emit_run_terminal(progress, state)
+            return state
         run = self.runs.get(run_id)
         provider_client = self._client_for(run.provider)
         prepare_selected = getattr(provider_client, 'prepare_selected_scope', None)
@@ -247,6 +274,48 @@ class LiveWorkflowEngine(WorkflowEngine):
         project, run = self._records(context.project_id, context.run_id)
         return RunArtifactLayout(self.paths, project, run)
 
+    def _template_prerequisite(self, project_root, sources, selected_source_ids):
+        selected_ids = set(selected_source_ids)
+        templates = [item for item in sources
+                     if item.source_id in selected_ids and item.kind == 'docx']
+        if not templates:
+            return ''
+        if len(templates) != 1:
+            return '本次只能选择一个 Word 模板；请调整文件范围后重新运行。'
+        try:
+            item = templates[0]
+            path = validate_managed_path(project_root / item.relative_path)
+            _read(path, limit=64 * 1024 * 1024, digest=item.sha256)
+            inspection = inspect_template(path)
+            if self._template_mapping_for(project_root, inspection) is None:
+                return '已选 Word 模板尚无匹配的已确认章节映射，请先到 Word 模板页保存映射。'
+        except (OSError, TypeError, ValueError):
+            return '已选 Word 模板或章节映射不可用，请先到 Word 模板页重新检查并保存。'
+        return ''
+
+    def _template_mapping_for(self, project_root, inspection):
+        if self.template_mapping is not None:
+            self.template_mapping.validate_for(inspection)
+            return self.template_mapping
+        directory = validate_managed_path(project_root / '70_review')
+        if not directory.is_dir():
+            return None
+        candidates = []
+        for path in directory.glob('template-mapping-v*.json'):
+            match = re.fullmatch(r'template-mapping-v([0-9]{4})\.json', path.name)
+            if match and not path.is_symlink():
+                candidates.append((int(match.group(1)), path))
+        for version, _ in sorted(candidates, reverse=True):
+            try:
+                mapping = TemplateMapping.load(project_root, version=version)
+                if mapping.template_sha256 != inspection.template_sha256:
+                    continue
+                mapping.validate_for(inspection)
+                return mapping
+            except (OSError, TypeError, ValueError):
+                continue
+        return None
+
     def _artifact_content(self, context, artifact):
         layout = self._layout(context)
         prefix = layout.run.relative_path + '/'
@@ -262,7 +331,8 @@ class LiveWorkflowEngine(WorkflowEngine):
         artifact = max(matches, key=lambda item: item.delivery)
         return _json(self._artifact_content(context, artifact).decode('utf-8'))
 
-    def _request(self, context, fields, extra, cancel_event=None, progress=None):
+    def _request(self, context, fields, extra, cancel_event=None, progress=None,
+                 *, response_validator=None):
         attempt = getattr(context, 'attempt', None)
         upstream = []
         for artifact in context.upstream_artifacts:
@@ -312,84 +382,113 @@ class LiveWorkflowEngine(WorkflowEngine):
         client = self._client_for(getattr(context, 'provider', None))
         generate_with_progress = getattr(client, 'generate_with_progress', None)
         use_progress = progress is not None and callable(generate_with_progress)
-        self._emit_progress(progress, ProgressKind.AGENT_REQUEST_STARTED,
-                            'Agent 请求已准备', stage=context.stage, attempt=attempt)
-        terminal_kind = None
 
-        def on_agent_event(event):
-            nonlocal terminal_kind
-            if not isinstance(event, AgentEvent) or event.run_id != progress.run_id:
-                self._emit_progress(progress, ProgressKind.AGENT_FAILED,
-                                    'Agent 事件无法安全显示', stage=context.stage,
-                                    attempt=attempt)
-                terminal_kind = ProgressKind.AGENT_FAILED
-                return
-            if event.kind is EventKind.STARTED:
-                self._emit_progress(progress, ProgressKind.AGENT_WAITING,
-                                    'Agent 正在处理请求', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id)
-            elif event.kind is EventKind.TEXT:
-                self._emit_progress(progress, ProgressKind.AGENT_MESSAGE,
-                                    'Agent 可见消息', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id,
-                                    detail=event.text)
-            elif event.kind in (EventKind.TOOL_STARTED, EventKind.TOOL_FINISHED):
-                self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
-                                    'Agent 工具事件未获本次运行授权', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id,
-                                    detail='该动作未由本次运行执行。')
-            elif event.kind is EventKind.COMPLETED:
-                self._emit_progress(progress, ProgressKind.AGENT_COMPLETED,
-                                    'Agent 已返回响应', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id)
-                terminal_kind = ProgressKind.AGENT_COMPLETED
-            elif event.kind is EventKind.FAILED:
-                self._emit_progress(progress, ProgressKind.AGENT_FAILED,
-                                    'Agent 请求失败', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id)
-                terminal_kind = ProgressKind.AGENT_FAILED
-            elif event.kind is EventKind.CANCELLED:
-                self._emit_progress(progress, ProgressKind.AGENT_CANCELLED,
-                                    'Agent 请求已取消', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id)
-                terminal_kind = ProgressKind.AGENT_CANCELLED
-            elif event.kind is EventKind.BLOCKED:
-                self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
-                                    'Agent 操作已拦截', stage=context.stage,
-                                    attempt=attempt, item_id=event.item_id,
-                                    detail='当前运行策略不允许此动作。')
-                terminal_kind = ProgressKind.AGENT_BLOCKED
+        def request_once(request_prompt):
+            self._emit_progress(progress, ProgressKind.AGENT_REQUEST_STARTED,
+                                'Agent 请求已准备', stage=context.stage, attempt=attempt)
+            terminal_kind = None
 
-        try:
-            if use_progress:
-                raw = generate_with_progress(
-                    context, prompt, cancel_event=cancel_event, event_callback=on_agent_event)
-            else:
-                self._emit_progress(progress, ProgressKind.AGENT_WAITING,
-                                    '等待 Agent 响应', stage=context.stage,
-                                    attempt=attempt)
-                raw = client.generate(context, prompt, cancel_event=cancel_event)
+            def on_agent_event(event):
+                nonlocal terminal_kind
+                if not isinstance(event, AgentEvent) or event.run_id != progress.run_id:
+                    self._emit_progress(progress, ProgressKind.AGENT_FAILED,
+                                        'Agent 事件无法安全显示', stage=context.stage,
+                                        attempt=attempt)
+                    terminal_kind = ProgressKind.AGENT_FAILED
+                    return
+                if event.kind is EventKind.STARTED:
+                    self._emit_progress(progress, ProgressKind.AGENT_WAITING,
+                                        'Agent 正在处理请求', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id)
+                elif event.kind is EventKind.TEXT:
+                    self._emit_progress(progress, ProgressKind.AGENT_MESSAGE,
+                                        'Agent 可见消息', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id,
+                                        detail=event.text)
+                elif event.kind in (EventKind.TOOL_STARTED, EventKind.TOOL_FINISHED):
+                    self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
+                                        'Agent 工具事件未获本次运行授权', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id,
+                                        detail='该动作未由本次运行执行。')
+                elif event.kind is EventKind.COMPLETED:
+                    self._emit_progress(progress, ProgressKind.AGENT_COMPLETED,
+                                        'Agent 已返回响应', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id)
+                    terminal_kind = ProgressKind.AGENT_COMPLETED
+                elif event.kind is EventKind.FAILED:
+                    self._emit_progress(progress, ProgressKind.AGENT_FAILED,
+                                        'Agent 请求失败', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id)
+                    terminal_kind = ProgressKind.AGENT_FAILED
+                elif event.kind is EventKind.CANCELLED:
+                    self._emit_progress(progress, ProgressKind.AGENT_CANCELLED,
+                                        'Agent 请求已取消', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id)
+                    terminal_kind = ProgressKind.AGENT_CANCELLED
+                elif event.kind is EventKind.BLOCKED:
+                    self._emit_progress(progress, ProgressKind.AGENT_BLOCKED,
+                                        'Agent 操作已拦截', stage=context.stage,
+                                        attempt=attempt, item_id=event.item_id,
+                                        detail='当前运行策略不允许此动作。')
+                    terminal_kind = ProgressKind.AGENT_BLOCKED
+
+            try:
+                if use_progress:
+                    raw = generate_with_progress(
+                        context, request_prompt, cancel_event=cancel_event,
+                        event_callback=on_agent_event)
+                else:
+                    self._emit_progress(progress, ProgressKind.AGENT_WAITING,
+                                        '等待 Agent 响应', stage=context.stage,
+                                        attempt=attempt)
+                    raw = client.generate(context, request_prompt, cancel_event=cancel_event)
+            except Exception:
+                if terminal_kind is None:
+                    kind = (ProgressKind.AGENT_CANCELLED if cancel_event is not None and cancel_event.is_set()
+                            else ProgressKind.AGENT_FAILED)
+                    title = 'Agent 请求已取消' if kind is ProgressKind.AGENT_CANCELLED else 'Agent 请求失败'
+                    self._emit_progress(progress, kind, title, stage=context.stage,
+                                        attempt=attempt)
+                raise
+
             if cancel_event is not None and cancel_event.is_set():
                 if terminal_kind is not ProgressKind.AGENT_CANCELLED:
                     self._emit_progress(progress, ProgressKind.AGENT_CANCELLED,
                                         'Agent 请求已取消', stage=context.stage,
                                         attempt=attempt)
-                    terminal_kind = ProgressKind.AGENT_CANCELLED
                 raise RuntimeError('阶段已取消。')
-            result = _json(raw, fields)
             if terminal_kind is None:
                 self._emit_progress(progress, ProgressKind.AGENT_COMPLETED,
                                     'Agent 已返回响应', stage=context.stage,
                                     attempt=attempt)
-            return result
-        except Exception:
-            if terminal_kind is None:
-                kind = (ProgressKind.AGENT_CANCELLED if cancel_event is not None and cancel_event.is_set()
-                        else ProgressKind.AGENT_FAILED)
-                title = 'Agent 请求已取消' if kind is ProgressKind.AGENT_CANCELLED else 'Agent 请求失败'
-                self._emit_progress(progress, kind, title, stage=context.stage,
-                                    attempt=attempt)
-            raise
+            try:
+                return _json(raw, fields)
+            except json.JSONDecodeError:
+                raise
+            except (ValueError, TypeError):
+                raise _AgentResponseContractError from None
+
+        for correction in range(2):
+            request_prompt = prompt + (_JSON_REPAIR_INSTRUCTION if correction else '')
+            if correction:
+                self._emit_progress(
+                    progress, ProgressKind.STAGE_PROGRESS,
+                    'Agent 回复未通过 JSON 或结构校验，正在进行一次格式纠正重试',
+                    stage=context.stage, attempt=attempt,
+                    detail='重试使用相同阶段输入与固定格式说明；不会附带上一条原始回复。',
+                )
+            try:
+                value = request_once(request_prompt)
+                if response_validator is not None:
+                    try:
+                        response_validator(value)
+                    except (ValueError, TypeError, KeyError):
+                        raise _AgentResponseContractError from None
+                return value
+            except (json.JSONDecodeError, _AgentResponseContractError):
+                if correction:
+                    raise _AgentResponseFormatError from None
+        raise _AgentResponseFormatError
 
     def _execute_stage_with_progress(self, context, artifact_directory, cancel_event, progress):
         return self._execute_stage(context, artifact_directory, cancel_event, progress=progress)
@@ -420,7 +519,7 @@ class LiveWorkflowEngine(WorkflowEngine):
             if context.stage is Stage.CODE_GENERATION:
                 return self._generate_code(context, cancel_event, progress)
             if context.stage is Stage.CALCULATION:
-                return self._calculate(context, cancel_event)
+                return self._calculate(context, cancel_event, progress)
             if context.stage is Stage.RESULT_VALIDATION:
                 return self._validate(context)
             if context.stage is Stage.PAPER_DRAFTING:
@@ -430,8 +529,11 @@ class LiveWorkflowEngine(WorkflowEngine):
             raise ValueError('未知工作流阶段。')
         except (ValueError, TypeError, KeyError, OSError, UnicodeError, RecursionError, SyntaxError, RuntimeError) as exc:
             # Never persist raw model text, paths, credentials, or provider exception text.
+            diagnostic = ('Agent 回复 JSON 格式或结构无效；一次格式纠正重试仍失败。当前阶段已暂停。'
+                          if isinstance(exc, _AgentResponseFormatError) else
+                          '阶段输入、输出协议或本地证据校验未通过：' + type(exc).__name__)
             return self._paused(context.stage, context.attempt, PauseReason.VALIDATION_FAILED,
-                                '阶段输入、输出协议或本地证据校验未通过：' + type(exc).__name__)
+                                diagnostic)
 
     @staticmethod
     def _specifications(outputs, attempt):
@@ -472,7 +574,7 @@ class LiveWorkflowEngine(WorkflowEngine):
             raise ValueError('计算服务未返回可信工件标识。')
         return asdict(evidence)
 
-    def _calculate(self, context, cancel_event):
+    def _calculate(self, context, cancel_event, progress=None):
         layout = self._layout(context)
         scripts = [item for item in context.upstream_artifacts if item.kind == 'script']
         if not scripts:
@@ -494,36 +596,243 @@ class LiveWorkflowEngine(WorkflowEngine):
                 context.stage, context.attempt, PauseReason.MISSING_DATA,
                 '缺少已选择的计算输入；请至少选择一个 CSV、XLSX 或 DOCX 数据附件。',
             )
+
+        previous = self._previous_calculation(context, layout)
+        repair_attempt_count = self._repair_attempt_count(previous)
+        if repair_attempt_count is None:
+            return self._paused_after_repair(context, previous or {},
+                                             '已有计算修复次数记录无效；未继续执行。')
+        if repair_attempt_count >= _MAX_CODE_REPAIR_ATTEMPTS:
+            return self._paused_after_repair(context, previous,
+                                             '本次计算代码修复次数已达上限；请检查保留的脚本与阶段记录。')
+        attempt = context.attempt
+        if previous is not None:
+            if (previous.get('stage_status') != StageStatus.PAUSED.value
+                    or type(previous.get('calculation_attempt')) is not int
+                    or previous.get('calculation_attempt') < 0):
+                return self._paused_after_repair(context, previous,
+                                                 '已有计算阶段记录无法安全重放；未覆盖旧工件。')
+            attempt = previous['calculation_attempt'] + 1
+        specs = self._specifications(declaration['outputs'], attempt)
+
         outcome = self.computation_runner.run(layout, source, input_files=tuple(files),
-                                              deterministic_seed=self.deterministic_seed, attempt=context.attempt,
+                                              deterministic_seed=self.deterministic_seed, attempt=attempt,
                                               cancel_event=cancel_event, expected_outputs=specs,
                                               input_hashes=tuple(file_hashes))
-        if outcome.stage_status is StageStatus.CANCELLED:
-            return StageResult(context.stage, context.attempt, StageStatus.CANCELLED, diagnostic='计算服务已取消。')
+        failure_summary = getattr(outcome, 'failure_summary', None)
+        if (outcome.stage_status is StageStatus.PAUSED and outcome.execution_started is True
+                and type(getattr(outcome, 'exit_code', None)) is int
+                and isinstance(failure_summary, ExecutionFailureSummary)
+                and (outcome.exit_code != 0
+                     or failure_summary.error_type == 'OutputValidationError')
+                and context.attempt == 0 and repair_attempt_count < _MAX_CODE_REPAIR_ATTEMPTS):
+            return self._repair_and_run(
+                context, layout, source, declaration, specs, tuple(files), tuple(file_hashes),
+                attempt, failure_summary, progress, outcome, cancel_event,
+                repair_attempt_count=repair_attempt_count,
+            )
+        return self._calculation_result(context, layout, declaration, specs, outcome, attempt,
+                                        repair_attempt_count=repair_attempt_count,
+                                        repair_diagnostic=None)
+
+    @staticmethod
+    def _repair_attempt_count(previous):
+        if previous is None:
+            return 0
+        if not isinstance(previous, dict):
+            return None
+        if 'repair_attempt_count' not in previous:
+            return 1 if previous.get('repair_attempted') is True else 0
+        count = previous.get('repair_attempt_count')
+        if (type(count) is not int or not 0 <= count <= _MAX_CODE_REPAIR_ATTEMPTS
+                or previous.get('repair_attempted') is not (count > 0)):
+            return None
+        return count
+
+    def _previous_calculation(self, context, layout):
+        run = self.runs.get(context.run_id)
+        if run is None:
+            raise ValueError('运行记录不存在。')
+        state = CheckpointStore(layout, self.runs).recover(run)
+        matches = [item for item in state.artifacts
+                   if item.stage is Stage.CALCULATION
+                   and Path(item.relative_path).name == 'calculation.json']
+        if not matches:
+            return None
+        artifact = max(matches, key=lambda item: item.delivery)
+        return _json(self._artifact_content(context, artifact).decode('utf-8'))
+
+    def _repair_and_run(self, context, layout, source, declaration, specs, files, file_hashes,
+                        failed_attempt, failure_summary, progress, failed_outcome, cancel_event,
+                        *, repair_attempt_count, repaired_sources=()):
+        if context.attempt != 0:
+            return self._calculation_result(context, layout, declaration, specs, failed_outcome,
+                                            failed_attempt,
+                                            repair_attempt_count=repair_attempt_count,
+                                            repair_diagnostic=failure_summary,
+                                            repaired_sources=repaired_sources)
+        next_repair_count = repair_attempt_count + 1
+        if next_repair_count > _MAX_CODE_REPAIR_ATTEMPTS:
+            return self._calculation_result(context, layout, declaration, specs, failed_outcome,
+                                            failed_attempt,
+                                            repair_attempt_count=repair_attempt_count,
+                                            repair_diagnostic=failure_summary,
+                                            repaired_sources=repaired_sources)
+        self._emit_progress(progress, ProgressKind.STAGE_PROGRESS,
+                            f'计算失败，正在进行第 {next_repair_count} 次受限代码修复',
+                            stage=Stage.CALCULATION,
+                            attempt=context.attempt, detail=failure_summary.display_text())
+        repair_context = replace(
+            context, stage=Stage.CODE_GENERATION, attempt=next_repair_count, authorized_problem=None,
+            problem_evidence_id=None, inputs=(),
+            system_instructions=(
+                'Repair the supplied generated Python source for the single reported runtime error. '
+                'Preserve its model, methods, selected input names, and declared outputs. Do not add '
+                'network, subprocess, shell, file access outside the supplied input/output folders, or tools.'
+            ),
+        )
+        try:
+            value = self._request(repair_context, {'source', 'outputs'}, {
+                'repair_request': {
+                    'generated_source': source,
+                    'safe_execution_diagnostic': failure_summary.to_dict(),
+                    'instruction': ('修复报告的运行错误，保持原模型、方法、输入名和输出声明不变；'
+                                    '不要增加网络、子进程、Shell 或额外文件访问。'),
+                },
+            }, cancel_event=cancel_event, progress=progress)
+            if value['outputs'] != declaration['outputs']:
+                raise ValueError('修复代码改变了输出协议。')
+            repaired_source = value['source']
+            if (not isinstance(repaired_source, str) or not repaired_source.strip()
+                    or '\0' in repaired_source or len(repaired_source.encode('utf-8')) > 2 * 1024 * 1024):
+                raise ValueError('修复代码长度或内容无效。')
+            ast.parse(repaired_source)
+            self._specifications(value['outputs'], failed_attempt + 1)
+        except Exception:
+            if cancel_event is not None and cancel_event.is_set():
+                return StageResult(context.stage, context.attempt, StageStatus.CANCELLED,
+                                   diagnostic='计算代码修复请求已取消。')
+            return self._repair_pause_result(context, declaration, failed_outcome,
+                                             failed_attempt, failure_summary, next_repair_count,
+                                             '代码修复请求未能通过协议校验；已暂停，未执行该版本。',
+                                             repaired_sources=repaired_sources)
+
+        if progress is not None:
+            self._emit_progress(progress, ProgressKind.STAGE_PROGRESS,
+                                '修复代码已通过协议检查，正在 Sandbox 重跑',
+                                stage=Stage.CALCULATION, attempt=context.attempt)
+        repaired_attempt = failed_attempt + 1
+        repaired_specs = self._specifications(declaration['outputs'], repaired_attempt)
+        outcome = self.computation_runner.run(
+            layout, repaired_source, input_files=files,
+            deterministic_seed=self.deterministic_seed, attempt=repaired_attempt,
+            cancel_event=cancel_event, expected_outputs=repaired_specs, input_hashes=file_hashes,
+        )
+        accumulated_sources = (*repaired_sources, (next_repair_count, repaired_source))
+        next_failure = getattr(outcome, 'failure_summary', None)
+        if (outcome.stage_status is StageStatus.PAUSED and outcome.execution_started is True
+                and type(getattr(outcome, 'exit_code', None)) is int
+                and isinstance(next_failure, ExecutionFailureSummary)
+                and (outcome.exit_code != 0 or next_failure.error_type == 'OutputValidationError')
+                and next_repair_count < _MAX_CODE_REPAIR_ATTEMPTS):
+            return self._repair_and_run(
+                context, layout, repaired_source, declaration, repaired_specs, files, file_hashes,
+                repaired_attempt, next_failure, progress, outcome, cancel_event,
+                repair_attempt_count=next_repair_count, repaired_sources=accumulated_sources,
+            )
+        return self._calculation_result(
+            context, layout, declaration, repaired_specs, outcome, repaired_attempt,
+            repair_attempt_count=next_repair_count, repair_diagnostic=failure_summary,
+            repaired_sources=accumulated_sources,
+        )
+
+    def _repair_pause_result(self, context, declaration, failed_outcome, attempt,
+                             failure_summary, repair_attempt_count, diagnostic,
+                             *, repaired_sources=()):
+        manifest = self._calculation_manifest(declaration, failed_outcome, attempt,
+                                              repair_attempt_count=repair_attempt_count,
+                                              repair_diagnostic=failure_summary)
+        return StageResult(context.stage, context.attempt, StageStatus.PAUSED,
+                           tuple(StageOutput(f'generated-repair-v{count:04d}.py',
+                                             source.encode('utf-8'), 'script')
+                                 for count, source in repaired_sources)
+                           + (self._output('calculation.json', manifest),), diagnostic,
+                           PauseReason.VALIDATION_FAILED)
+
+    def _paused_after_repair(self, context, previous, diagnostic):
+        output = self._output('calculation.json', previous)
+        return StageResult(context.stage, context.attempt, StageStatus.PAUSED,
+                           (output,), diagnostic, PauseReason.VALIDATION_FAILED)
+
+    def _calculation_manifest(self, declaration, outcome, attempt, *, repair_attempt_count,
+                              repair_diagnostic):
         evidence = tuple(item for item in (outcome.script_evidence, outcome.summary_evidence,
                                           *getattr(outcome, 'artifacts', ())) if item is not None)
+        failure_summary = getattr(outcome, 'failure_summary', None)
         manifest = {'execution_started': outcome.execution_started is True,
                     'stage_status': StageStatus(outcome.stage_status).value,
-                    'outputs': declaration['outputs'], 'calculation_attempt': context.attempt,
+                    'outputs': declaration['outputs'], 'calculation_attempt': attempt,
+                    'exit_code': getattr(outcome, 'exit_code', None),
+                    'failure_summary': (failure_summary.to_dict()
+                                        if isinstance(failure_summary, ExecutionFailureSummary) else None),
+                    'repair_attempted': repair_attempt_count > 0,
+                    'repair_attempt_count': repair_attempt_count,
+                    'repair_diagnostic': (None if repair_diagnostic is None
+                                          else repair_diagnostic.to_dict()),
                     'evidence': [self._evidence_dict(item) for item in evidence],
                     'human_review_required': True, 'mathematical_correctness_verified': False}
+        return manifest
+
+    def _calculation_result(self, context, layout, declaration, specs, outcome, attempt,
+                            *, repair_attempt_count, repair_diagnostic, repaired_sources=()):
+        backend_diagnostic = getattr(outcome, 'blocked_reason', '')
+        if not isinstance(backend_diagnostic, str):
+            backend_diagnostic = ''
+        backend_diagnostic = ' '.join(backend_diagnostic.split())[:1200]
+
+        def diagnostic_with_backend(message):
+            if not backend_diagnostic or backend_diagnostic in message:
+                return message
+            return f'{message} {backend_diagnostic}'[:1600]
+
+        if outcome.stage_status is StageStatus.CANCELLED:
+            return StageResult(context.stage, context.attempt, StageStatus.CANCELLED,
+                               diagnostic=diagnostic_with_backend('计算服务已取消。'))
+        manifest = self._calculation_manifest(declaration, outcome, attempt,
+                                              repair_attempt_count=repair_attempt_count,
+                                              repair_diagnostic=repair_diagnostic)
         output = self._output('calculation.json', manifest)
+        repaired_output = tuple(StageOutput(f'generated-repair-v{count:04d}.py',
+                                            source.encode('utf-8'), 'script')
+                                for count, source in repaired_sources)
         if outcome.stage_status is StageStatus.PAUSED:
             diagnostic = ('受控 Python 隔离尚未通过预检，生成代码未执行；已暂停且没有继续起草。'
                           if outcome.execution_started is not True else
                           '沙盒计算未完成或输出校验失败；已暂停且没有继续起草。')
             pause_reason = (PauseReason.VALIDATION_FAILED if outcome.execution_started is True
                             else PauseReason.ADAPTER_UNAVAILABLE)
-            return StageResult(context.stage, context.attempt, StageStatus.PAUSED, (output,),
-                               diagnostic, pause_reason)
+            if repair_attempt_count:
+                if repair_attempt_count >= _MAX_CODE_REPAIR_ATTEMPTS:
+                    diagnostic += (f' 已完成 {repair_attempt_count} 次受限代码修复，'
+                                   '已保留修复代码并停止自动重试。')
+                else:
+                    diagnostic += (f' 已尝试 {repair_attempt_count}/'
+                                   f'{_MAX_CODE_REPAIR_ATTEMPTS} 次受限代码修复。')
+            return StageResult(context.stage, context.attempt, StageStatus.PAUSED,
+                               repaired_output + (output,),
+                               diagnostic_with_backend(diagnostic), pause_reason)
         if outcome.stage_status is not StageStatus.COMPLETED or outcome.execution_started is not True:
-            return StageResult(context.stage, context.attempt, StageStatus.FAILED, (output,), '受控计算未成功完成。')
+            return StageResult(context.stage, context.attempt, StageStatus.FAILED,
+                               repaired_output + (output,),
+                               diagnostic_with_backend('受控计算未成功完成。'))
         allowed = {spec.relative_path for spec in specs}
+        evidence = tuple(item for item in (outcome.script_evidence, outcome.summary_evidence,
+                                          *getattr(outcome, 'artifacts', ())) if item is not None)
         actual = {item.relative_path[len(layout.run.relative_path) + 1:]
                   for item in evidence if item.kind in ('table', 'figure')}
         if actual - allowed:
             raise ValueError('计算服务返回未声明的结果文件。')
-        return self._complete(context, output)
+        return self._complete(context, *repaired_output, output)
 
     def _validate(self, context):
         layout = self._layout(context)
@@ -544,13 +853,17 @@ class LiveWorkflowEngine(WorkflowEngine):
 
     def _template(self, context):
         selected = [item for item in context.inputs if item.kind == 'docx']
-        if len(selected) != 1 or self.template_mapping is None:
+        if not selected:
             return None
+        if len(selected) != 1:
+            raise TemplateMappingError('本次只能选择一个 Word 模板。')
         path = validate_managed_path(self._layout(context).project_root / selected[0].relative_path)
         _read(path, limit=64 * 1024 * 1024, digest=selected[0].sha256)
         inspection = inspect_template(path)
-        self.template_mapping.validate_for(inspection)
-        return path, inspection, self.template_mapping
+        mapping = self._template_mapping_for(self._layout(context).project_root, inspection)
+        if mapping is None:
+            raise TemplateMappingError('Word 模板尚无匹配的已确认章节映射。')
+        return path, inspection, mapping
 
     def _validated_evidence(self, context):
         manifest = self._latest(context, Stage.RESULT_VALIDATION, 'validation.json')
@@ -581,10 +894,11 @@ class LiveWorkflowEngine(WorkflowEngine):
         return headers, tuple(rows)
 
     def _paper(self, context, cancel_event, progress=None):
-        template = self._template(context)
-        if template is None:
+        try:
+            template = self._template(context)
+        except (OSError, TypeError, ValueError):
             return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
-                                '缺少唯一已选 DOCX 模板或用户确认的映射。')
+                                'Word 模板或章节映射不可用；请到 Word 模板页重新检查并保存。')
         evidence = self._validated_evidence(context)
         extras = []
         for item in evidence:
@@ -594,15 +908,49 @@ class LiveWorkflowEngine(WorkflowEngine):
                 entry = {**entry, 'headers': headers, 'rows_preview': rows[:100],
                          'total_rows': len(rows), 'preview_truncated': len(rows) > 100}
             extras.append(entry)
+        paper_contract = {
+            'section_key_pattern': '^[a-z][a-z0-9_-]{0,63}$',
+            'section_keys_unique_across_all_text_table_and_figure_blocks': True,
+            'explanatory_text_may_have_empty_evidence_ids': True,
+            'provided_evidence_ids_must_be_exact_validated_ids': True,
+            'references': 'Do not add URLs, DOI strings, or numbered reference citations.',
+        }
+        if template is None:
+            paper_contract.update({
+                'recommended_text_keys': ['abstract', 'problem_restatement', 'assumptions',
+                                          'notation', 'model', 'solution', 'verification', 'conclusion'],
+                'recommended_table_keys': [f'results_table_{index + 1}'
+                                           for index, item in enumerate(evidence) if item.kind == 'table'],
+                'recommended_figure_keys': [f'results_figure_{index + 1}'
+                                            for index, item in enumerate(evidence) if item.kind == 'figure'],
+            })
+        else:
+            paper_contract.update({
+                'allowed_text_or_figure_keys': [item.section_key for item in template[2].bindings
+                                               if item.kind == 'heading'],
+                'allowed_table_keys': [item.section_key for item in template[2].bindings
+                                       if item.kind == 'table'],
+            })
         value = self._request(context, {'sections', 'tables', 'figures'}, {
-            'validated_evidence': extras, 'confirmed_mapping': self.template_mapping.to_dict(),
+            'validated_evidence': extras,
+            'paper_contract': paper_contract,
+            'confirmed_mapping': None if template is None else template[2].to_dict(),
+            'document_layout': ('built_in_editable_word' if template is None else 'confirmed_user_template'),
             'reference_policy': 'No verified bibliographic sources supplied; do not cite or invent any.'},
-            cancel_event, progress)
-        draft = self._paper_draft(context, value, evidence)
+            cancel_event, progress,
+            response_validator=lambda value: self._paper_draft(context, value, evidence,
+                                                               template=template))
+        draft = self._paper_draft(context, value, evidence, template=template)
         layout = self._layout(context)
         directory = layout.path_for('60_paper')
         directory.mkdir(exist_ok=True)
         validate_managed_path(directory)
+        template_mode = 'custom'
+        template_relative_path = None
+        if template is None:
+            template = write_generic_template(directory, draft)
+            template_mode = 'builtin'
+            template_relative_path = template[0].relative_to(layout.root).as_posix()
         result = write_paper(template[0], directory, template[1], template[2], draft)
         paper_evidence = ArtifactEvidence(
             'ev_' + hashlib.sha256(f'{context.run_id}\0{result.sha256}\0{result.path.name}'.encode()).hexdigest()[:24],
@@ -612,13 +960,14 @@ class LiveWorkflowEngine(WorkflowEngine):
                                    for eid in block.evidence_ids))
         manifest = {'paper_evidence': self._evidence_dict(paper_evidence),
                     'template_sha256': result.source_sha256, 'mapping': template[2].to_dict(),
+                    'template_mode': template_mode, 'template_relative_path': template_relative_path,
                     'required_sections': [item.section_key for item in draft.sections],
                     'required_figures': [item.section_key for item in draft.figures],
                     'expected_evidence_ids': used, 'human_review_required': True,
                     'mathematical_correctness_verified': False}
         return self._complete(context, self._output('paper-manifest.json', manifest))
 
-    def _paper_draft(self, context, value, evidence):
+    def _paper_draft(self, context, value, evidence, *, template=None):
         indexed = {item.evidence_id: item for item in evidence}
         sections, tables, figures = [], [], []
         for key in ('sections', 'tables', 'figures'):
@@ -629,7 +978,7 @@ class LiveWorkflowEngine(WorkflowEngine):
         for item in value['sections']:
             if not isinstance(item, dict) or set(item) != {'section_key', 'paragraphs', 'evidence_ids'}:
                 raise ValueError('正文块字段无效。')
-            ids = _strings(item['evidence_ids'])
+            ids = _strings(item['evidence_ids'], nonempty=False)
             if any(eid not in indexed for eid in ids):
                 raise ValueError('正文引用未经验证的结果。')
             paragraphs = _strings(item['paragraphs'], chars=16000)
@@ -650,15 +999,43 @@ class LiveWorkflowEngine(WorkflowEngine):
                 else:
                     figures.append(FigureDraft(item['section_key'], self._result_bytes(context, artifact),
                                                'png', item['caption'], (artifact.evidence_id,)))
-        return PaperDraft(tuple(sections), tuple(tables), tuple(figures))
+        draft = PaperDraft(tuple(sections), tuple(tables), tuple(figures))
+        blocks = (*draft.sections, *draft.tables, *draft.figures)
+        if any(not isinstance(item.section_key, str)
+               or re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', item.section_key) is None
+               for item in blocks):
+            raise ValueError('论文章节键必须是短小写标识符。')
+        if template is not None:
+            bindings = {item.section_key: item.kind for item in template[2].bindings}
+            if (any(bindings.get(item.section_key) != 'heading'
+                    for item in (*draft.sections, *draft.figures))
+                    or any(bindings.get(item.section_key) != 'table' for item in draft.tables)):
+                raise ValueError('论文块不符合已确认模板映射。')
+        return draft
 
     def _qa(self, context):
-        template = self._template(context)
-        if template is None:
-            return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
-                                '模板或确认映射不可用，无法核对文档。')
         manifest = self._latest(context, Stage.PAPER_DRAFTING, 'paper-manifest.json')
-        if manifest['mapping'] != self.template_mapping.to_dict():
+        if manifest.get('template_mode') == 'builtin':
+            try:
+                template_path = self._layout(context).path_for(manifest['template_relative_path'])
+                inspection = inspect_template(template_path)
+                mapping = TemplateMapping.from_dict(manifest['mapping'])
+                mapping.validate_for(inspection)
+                if inspection.template_sha256 != manifest['template_sha256']:
+                    raise TemplateMappingError('Built-in template changed after paper creation.')
+                template = (template_path, inspection, mapping)
+            except (KeyError, OSError, TypeError, ValueError):
+                return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
+                                    '内置 Word 模板或章节映射不可用，无法核对文档。')
+        else:
+            try:
+                template = self._template(context)
+            except (OSError, TypeError, ValueError):
+                template = None
+            if template is None:
+                return self._paused(context.stage, context.attempt, PauseReason.UNSUPPORTED_TEMPLATE,
+                                    'Word 模板或确认映射不可用，无法核对文档。')
+        if manifest['mapping'] != template[2].to_dict():
             raise ValueError('确认映射与已生成论文不一致。')
         evidence = ArtifactEvidence(**manifest['paper_evidence'])
         layout = self._layout(context)

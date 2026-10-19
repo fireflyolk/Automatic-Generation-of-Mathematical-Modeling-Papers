@@ -17,7 +17,9 @@ sys.dont_write_bytecode = True
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_path
+from mathmodel_paper_studio.bootstrap.paths import (
+    AppPaths, validate_application_resource_path, validate_managed_path,
+)
 
 _SENSITIVE_NAMES = frozenset((
     ".env", "auth.json", "credentials", "credentials.json", "id_rsa", "id_ed25519",
@@ -123,6 +125,26 @@ def verify_lock(path, *, require_hashes=False):
     return tuple(versions)
 
 
+def verify_runtime_entry(runtime_entry, source_entry):
+    """Reject a bundled Sandbox launcher that differs from the host protocol."""
+    runtime_entry = validate_managed_path(Path(runtime_entry))
+    source_entry = validate_managed_path(Path(source_entry))
+    if not runtime_entry.is_file() or not source_entry.is_file():
+        raise ValueError("Sandbox runtime entry or protocol source is missing.")
+
+    def file_sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    runtime_digest = file_sha256(runtime_entry)
+    if runtime_digest != file_sha256(source_entry):
+        raise ValueError("Sandbox runtime entry does not match the current protocol source.")
+    return runtime_digest
+
+
 def export_licenses(lock_path, output):
     output = validate_managed_path(Path(output))
     output.mkdir(parents=True, exist_ok=False)
@@ -192,8 +214,8 @@ def prepare_startup(root=None):
     paths = AppPaths(root) if root is not None else AppPaths()
     paths.configure_environment()
     if getattr(sys, "frozen", False):
-        validate_managed_path(Path(sys.executable))
-        validate_managed_path(Path(sys._MEIPASS))
+        validate_application_resource_path(Path(sys.executable))
+        validate_application_resource_path(Path(sys._MEIPASS))
     from mathmodel_paper_studio.storage.database import Database
     Database(paths).migrate()
     managed = (paths.root, paths.state, paths.database, paths.projects, paths.logs,
@@ -229,12 +251,22 @@ def main(argv=None):
     parser.add_argument("--report")
     parser.add_argument("--inventory-root")
     parser.add_argument("--trusted-runtime-lock")
+    parser.add_argument("--runtime-entry")
+    parser.add_argument("--source-runtime-entry")
     parser.add_argument("--verify-lock")
     parser.add_argument("--licenses")
     parser.add_argument("--archive")
     args = parser.parse_args(argv)
     try:
-        if args.inventory_root:
+        if bool(args.runtime_entry) != bool(args.source_runtime_entry):
+            raise ValueError("Both runtime entry paths must be provided together.")
+        if args.runtime_entry:
+            payload = {
+                "sandbox_runtime_entry_sha256": verify_runtime_entry(
+                    args.runtime_entry, args.source_runtime_entry
+                )
+            }
+        elif args.inventory_root:
             if args.trusted_runtime_lock:
                 versions = verify_lock(args.trusted_runtime_lock, require_hashes=True)
                 payload = {
@@ -264,7 +296,8 @@ def main(argv=None):
         message = "\u542f\u52a8/\u53d1\u5e03\u68c0\u67e5\u5931\u8d25\uff1a" + str(exc)
         if sys.stderr is not None:
             print(message, file=sys.stderr)
-        if not args.startup_check and not any((args.inventory_root, args.verify_lock, args.archive)):
+        if not args.startup_check and not any((args.inventory_root, args.verify_lock,
+                                                args.archive, args.runtime_entry)):
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, message, "\u6570\u6a21\u8bba\u6587\u5de5\u4f5c\u53f0", 0x10)
         return 1

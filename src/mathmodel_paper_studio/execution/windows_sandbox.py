@@ -7,18 +7,41 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from uuid import UUID, uuid4
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
+from mathmodel_paper_studio.bootstrap.paths import (
+    validate_application_resource_path, validate_managed_path,
+)
 from mathmodel_paper_studio.domain.models import StageStatus
+from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
 
 
 GUEST_RUNTIME = r'C:\MMPS\runtime'
 GUEST_INPUT = r'C:\MMPS\input'
 GUEST_OUTPUT = r'C:\MMPS\output'
+GUEST_RESULT_FILENAME = '.mmps-execution-result.json'
+_MAX_GUEST_RESULT_BYTES = 4096
+_ACTIVE_SANDBOX_SESSIONS: set[str] = set()
+_ACTIVE_SANDBOX_SESSIONS_LOCK = threading.Lock()
+
+
+def _register_active_session(session_id: str) -> None:
+    with _ACTIVE_SANDBOX_SESSIONS_LOCK:
+        _ACTIVE_SANDBOX_SESSIONS.add(session_id)
+
+
+def _unregister_active_session(session_id: str) -> None:
+    with _ACTIVE_SANDBOX_SESSIONS_LOCK:
+        _ACTIVE_SANDBOX_SESSIONS.discard(session_id)
+
+
+def _session_is_active(session_id: str) -> bool:
+    with _ACTIVE_SANDBOX_SESSIONS_LOCK:
+        return session_id in _ACTIVE_SANDBOX_SESSIONS
 
 
 class SandboxExecutionError(RuntimeError):
@@ -52,6 +75,7 @@ class SandboxExecutionResult:
     dependency_fingerprint: str | None = None
     exit_code: int | None = None
     artifacts: tuple = ()
+    failure_summary: ExecutionFailureSummary | None = None
 
 
 def build_sandbox_configuration(*, memory_mib: int = 2048,
@@ -82,9 +106,11 @@ def build_sandbox_configuration(*, memory_mib: int = 2048,
     if mapped_folders:
         folders = SubElement(root, 'MappedFolders')
         for mapping in mapped_folders:
-            host = validate_managed_path(mapping.host_path)
+            host = (validate_application_resource_path(mapping.host_path)
+                    if mapping.guest_path == GUEST_RUNTIME
+                    else validate_managed_path(mapping.host_path))
             if not host.is_dir():
-                raise ValueError('Sandbox 映射源必须是存在的 F: 目录。')
+                raise ValueError('Sandbox 映射源必须是存在的受信任目录。')
             folder = SubElement(folders, 'MappedFolder')
             SubElement(folder, 'HostFolder').text = str(host)
             SubElement(folder, 'SandboxFolder').text = mapping.guest_path
@@ -144,11 +170,11 @@ def resolve_computation_runtime_root() -> Path:
     """Resolve the explicitly configured source runtime or bundled runtime."""
     configured = os.environ.get('MMPS_COMPUTATION_RUNTIME_ROOT', '').strip()
     if configured:
-        candidate = Path(configured)
+        return validate_managed_path(Path(configured))
     else:
         package_root = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
         candidate = package_root / 'computation-runtime'
-    return validate_managed_path(candidate)
+    return validate_application_resource_path(candidate)
 
 
 def _sha256(path: Path) -> str:
@@ -167,7 +193,7 @@ class WindowsSandboxExecutor:
                  startup_timeout: float = 90.0, poll_interval: float = 0.2):
         if not isinstance(runtime_root, Path):
             raise TypeError('Sandbox Python 运行时路径必须是 Path。')
-        self.runtime_root = validate_managed_path(runtime_root)
+        self.runtime_root = validate_application_resource_path(runtime_root)
         self.cli_path = cli_path or find_sandbox_cli()
         if self.cli_path is not None and not isinstance(self.cli_path, Path):
             raise TypeError('Windows Sandbox CLI 路径必须是 Path。')
@@ -188,7 +214,7 @@ class WindowsSandboxExecutor:
                 or not (self.runtime_root / 'Lib' / 'site-packages').is_dir()):
             return False, '数模计算运行时未完整安装。'
         try:
-            validate_managed_path(self.runtime_root)
+            validate_application_resource_path(self.runtime_root)
             if self.cli_path.drive.casefold() == 'f:':
                 validate_managed_path(self.cli_path)
             else:
@@ -216,7 +242,7 @@ class WindowsSandboxExecutor:
             for relative, expected in files.items():
                 if relative not in ('python.exe', 'python3.dll', 'python313.dll', 'sandbox_entry.py'):
                     return False, '数模运行时指纹清单无效。'
-                path = validate_managed_path(self.runtime_root / relative)
+                path = validate_application_resource_path(self.runtime_root / relative)
                 if not path.is_file() or _sha256(path) != expected:
                     return False, '数模运行时文件指纹与清单不一致。'
             if set(files) != {'python.exe', 'python3.dll', 'python313.dll', 'sandbox_entry.py'}:
@@ -226,12 +252,18 @@ class WindowsSandboxExecutor:
         return True, 'Windows Sandbox 与离线计算运行时已就绪。'
 
     @staticmethod
-    def _write_recovery_record(temp_root: Path, session_id: str, work_root: Path) -> Path:
+    def _write_recovery_record(temp_root: Path, session_id: str, work_root: Path,
+                               *, owner_pid: int | None = None) -> Path:
         recovery_root = validate_managed_path(temp_root / 'sandbox-recovery')
         recovery_root.mkdir(parents=True, exist_ok=True)
         validate_managed_path(recovery_root)
         record_path = validate_managed_path(recovery_root / f'{session_id}.json')
-        payload = {'schema_version': 1, 'session_id': session_id, 'work_root': str(work_root)}
+        payload = {
+            'schema_version': 1,
+            'session_id': session_id,
+            'work_root': str(work_root),
+            'owner_pid': os.getpid() if owner_pid is None else owner_pid,
+        }
         temporary = recovery_root / f'.{session_id}.{uuid4().hex}.tmp'
         with temporary.open('x', encoding='utf-8', newline='\n') as stream:
             json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
@@ -263,22 +295,70 @@ class WindowsSandboxExecutor:
                 if not record_path.is_file() or record_path.is_symlink() or record_path.stat().st_size > 4096:
                     return False
                 payload = json.loads(record_path.read_text('utf-8'))
+                if not isinstance(payload, dict):
+                    return False
                 session_id = payload.get('session_id')
-                if (not isinstance(payload, dict) or payload.get('schema_version') != 1
+                owner_pid = payload.get('owner_pid')
+                if (payload.get('schema_version') != 1
                         or not isinstance(session_id, str) or str(UUID(session_id)) != session_id):
                     return False
                 work_root = validate_managed_path(Path(payload.get('work_root', '')))
                 if (work_root.parent.resolve(strict=False) != validate_managed_path(temp_root).resolve(strict=False)
                         or not work_root.name.startswith('mmps-sandbox-')):
                     return False
-                if not self._stop(self.cli_path, session_id):
-                    return False
+                if owner_pid is None:
+                    # Older records have no owner PID. Clean them only when the session
+                    # is already absent; otherwise its owner cannot be identified safely.
+                    if session_id in _sandbox_ids(self.cli_path):
+                        return False
+                else:
+                    if type(owner_pid) is not int or owner_pid <= 0:
+                        return False
+                    owner_alive = self._owner_process_alive(owner_pid)
+                    if owner_alive and (owner_pid != os.getpid() or _session_is_active(session_id)):
+                        return False
+                    if not self._stop(self.cli_path, session_id):
+                        return False
                 if work_root.exists():
                     self._remove_work_root(work_root)
                 self._remove_recovery_record(record_path)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError, SandboxExecutionError):
+            except (OSError, subprocess.SubprocessError, ValueError, TypeError,
+                    json.JSONDecodeError, SandboxExecutionError):
                 return False
         return True
+
+    @staticmethod
+    def _owner_process_alive(process_id: int) -> bool:
+        """Treat unknown process status as live so recovery never kills an active owner."""
+        if type(process_id) is not int or process_id <= 0:
+            return True
+        if os.name == 'nt':
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                open_process = kernel32.OpenProcess
+                open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+                open_process.restype = wintypes.HANDLE
+                close_handle = kernel32.CloseHandle
+                close_handle.argtypes = (wintypes.HANDLE,)
+                close_handle.restype = wintypes.BOOL
+                handle = open_process(0x1000, False, process_id)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if handle:
+                    close_handle(handle)
+                    return True
+                return ctypes.get_last_error() not in (87, 1168)  # invalid parameter / not found
+            except (AttributeError, OSError):
+                return True
+        try:
+            os.kill(process_id, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
 
     def execute(self, layout, script_path: Path, input_files: tuple[Path, ...],
                 expected_outputs: tuple[ArtifactExpectation, ...], *,
@@ -292,6 +372,9 @@ class WindowsSandboxExecutor:
             return SandboxExecutionResult(StageStatus.PAUSED, False, reason)
         if not expected_outputs or any(not isinstance(item, ArtifactExpectation) for item in expected_outputs):
             return SandboxExecutionResult(StageStatus.PAUSED, False, '没有有效的计算输出计划。')
+        if any(Path(item.relative_path).name.casefold() == GUEST_RESULT_FILENAME.casefold()
+               for item in expected_outputs):
+            return SandboxExecutionResult(StageStatus.PAUSED, False, '计算输出占用了保留结果记录名。')
         if len(expected_outputs) > 16 or len({Path(item.relative_path).name.casefold()
                                                for item in expected_outputs}) != len(expected_outputs):
             return SandboxExecutionResult(StageStatus.PAUSED, False, '计算输出计划无效。')
@@ -331,6 +414,7 @@ class WindowsSandboxExecutor:
         safe_to_cleanup = True
         shutdown_uncertain = False
         recovery_record = None
+        session_registered = False
         command = guest_command()
         fingerprint = _sha256(self.runtime_root / 'runtime-manifest.json')
 
@@ -379,6 +463,8 @@ class WindowsSandboxExecutor:
             )
             config = build_sandbox_configuration(memory_mib=memory_mib,
                                                  mapped_folders=mappings)
+            _register_active_session(session_id)
+            session_registered = True
             recovery_record = self._write_recovery_record(layout.paths.temp, session_id, work_root)
             # A timed-out or partially successful start may still have created the session.
             launched = True
@@ -437,7 +523,7 @@ class WindowsSandboxExecutor:
                     return SandboxExecutionResult(StageStatus.PAUSED, True, reason,
                                                   ('wsb', 'exec'), 'sandbox:python.exe', fingerprint)
                 time.sleep(self.poll_interval)
-            stdout, _stderr = process.communicate(timeout=5)
+            _stdout, _stderr = process.communicate(timeout=5)
             if process.returncode != 0:
                 stopped = stop_session()
                 reason = ('沙盒中的计算程序返回失败状态。' if stopped
@@ -445,19 +531,29 @@ class WindowsSandboxExecutor:
                 return SandboxExecutionResult(StageStatus.PAUSED, True, reason,
                                               ('wsb', 'exec'), 'sandbox:python.exe', fingerprint,
                                               process.returncode)
-            exit_code = self._guest_exit_code(stdout)
-            if exit_code != 0:
-                stopped = stop_session()
-                reason = ('沙盒中的计算程序返回失败状态。' if stopped
-                          else '沙盒中的计算程序返回失败状态；' + shutdown_warning())
-                return SandboxExecutionResult(StageStatus.PAUSED, True, reason,
-                                              ('wsb', 'exec'), 'sandbox:python.exe', fingerprint,
-                                              exit_code)
             if not stop_session():
                 return SandboxExecutionResult(StageStatus.PAUSED, True,
                                               shutdown_warning() + ' 结果未登记。',
                                               ('wsb', 'exec'), 'sandbox:python.exe', fingerprint, 0)
             started = False
+            try:
+                exit_code, failure_summary = self._read_guest_result(output_root)
+                result_path = output_root / GUEST_RESULT_FILENAME
+                result_path.chmod(0o600)
+                result_path.unlink()
+            except (OSError, SandboxExecutionError, ValueError):
+                return SandboxExecutionResult(
+                    StageStatus.PAUSED, True,
+                    'Windows Sandbox 未返回可信的计算结果记录。',
+                    ('wsb', 'exec'), 'sandbox:python.exe', fingerprint,
+                )
+            if exit_code != 0:
+                reason = '沙盒中的计算程序返回失败状态。'
+                if failure_summary is not None:
+                    reason += ' ' + failure_summary.display_text()
+                return SandboxExecutionResult(StageStatus.PAUSED, True, reason,
+                                              ('wsb', 'exec'), 'sandbox:python.exe', fingerprint,
+                                              exit_code, failure_summary=failure_summary)
             total, unexpected = self._inspect_output(output_root, expected_outputs)
             if unexpected or total > min(256 * 1024 ** 2, len(expected_outputs) * artifact_bytes):
                 raise SandboxExecutionError('Sandbox 输出目录超出文件或大小限制。')
@@ -471,9 +567,12 @@ class WindowsSandboxExecutor:
                 self._bounded_copy(source, target, artifact_bytes)
             report = ResultValidator(layout).validate(expected_outputs)
             if report.stage_status is not StageStatus.COMPLETED:
+                failure_summary = ExecutionFailureSummary('OutputValidationError', None, None)
                 return SandboxExecutionResult(StageStatus.PAUSED, True,
-                                              '计算已运行，但输出没有通过 CSV/PNG 结构校验。',
-                                              ('wsb', 'exec'), 'sandbox:python.exe', fingerprint, 0)
+                                              '计算已运行，但输出没有通过 CSV/PNG 结构校验。 '
+                                              + failure_summary.display_text(),
+                                              ('wsb', 'exec'), 'sandbox:python.exe', fingerprint, 0,
+                                              failure_summary=failure_summary)
             return SandboxExecutionResult(StageStatus.COMPLETED, True, '', ('wsb', 'exec'),
                                           'sandbox:python.exe', fingerprint, 0, report.evidence)
         except (OSError, subprocess.SubprocessError, SandboxExecutionError, ValueError):
@@ -489,6 +588,8 @@ class WindowsSandboxExecutor:
         finally:
             if launched:
                 stop_session()
+            if session_registered:
+                _unregister_active_session(session_id)
             if process is not None and process.poll() is None:
                 process.kill()
                 try:
@@ -505,27 +606,54 @@ class WindowsSandboxExecutor:
                     pass
 
     @staticmethod
-    def _guest_exit_code(stdout: str) -> int:
+    def _read_guest_result(output_root: Path) -> tuple[int, ExecutionFailureSummary | None]:
+        """Read the trusted wrapper's bounded result file, not ``wsb exec`` stdout.
+
+        Windows Sandbox CLI formats its own JSON response and does not forward
+        the executed process's standard streams. The wrapper therefore returns
+        its child status through one reserved file in the output mapping.
+        """
+        root = validate_managed_path(Path(output_root))
+        path = validate_managed_path(root / GUEST_RESULT_FILENAME)
         try:
-            value = json.loads(stdout)
-        except (TypeError, json.JSONDecodeError):
-            return 0 if not stdout.strip() else -1
-        if not isinstance(value, dict):
-            return -1
-        candidates = (value.get('ExitCode'), value.get('exitCode'), value.get('ExitStatus'))
-        for candidate in candidates:
-            if type(candidate) is int:
-                return candidate
-        result = value.get('Result')
-        if isinstance(result, dict):
-            for key in ('ExitCode', 'exitCode', 'ExitStatus'):
-                if type(result.get(key)) is int:
-                    return result[key]
-        return 0 if value.get('Success') is True else -1
+            if path.is_symlink() or not path.is_file():
+                raise SandboxExecutionError('Sandbox result record is missing or unsafe.')
+            if path.stat().st_size > _MAX_GUEST_RESULT_BYTES:
+                raise SandboxExecutionError('Sandbox result record exceeds its size limit.')
+            text = path.read_text(encoding='utf-8')
+
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError('duplicate result field')
+                    value[key] = item
+                return value
+
+            def reject_constant(_value):
+                raise ValueError('non-finite result value')
+
+            result = json.loads(text, object_pairs_hook=unique_object,
+                                parse_constant=reject_constant)
+        except SandboxExecutionError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise SandboxExecutionError('Sandbox result record is malformed.') from exc
+        if type(result) is not dict or set(result) != {'ExitCode', 'Failure'}:
+            raise SandboxExecutionError('Sandbox result record has an invalid schema.')
+        exit_code = result['ExitCode']
+        if type(exit_code) is not int or not -(2 ** 31) <= exit_code <= 2 ** 32 - 1:
+            raise SandboxExecutionError('Sandbox result exit code is invalid.')
+        raw_failure = result['Failure']
+        failure = None if raw_failure is None else ExecutionFailureSummary.from_value(raw_failure)
+        if (raw_failure is not None and failure is None) or (exit_code == 0 and failure is not None):
+            raise SandboxExecutionError('Sandbox result failure summary is invalid.')
+        return exit_code, failure
 
     @staticmethod
     def _inspect_output(output_root: Path, expected_outputs: tuple[ArtifactExpectation, ...]):
         allowed = {Path(item.relative_path).name.casefold() for item in expected_outputs}
+        allowed.add(GUEST_RESULT_FILENAME.casefold())
         total = 0
         unexpected = False
         for child in output_root.iterdir():

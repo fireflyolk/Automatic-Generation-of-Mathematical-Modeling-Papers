@@ -5,7 +5,8 @@ import unittest
 import uuid
 
 from mathmodel_paper_studio.bootstrap.paths import (
-    AppPaths, PathPolicyError, APPROVED_BASE, validate_import_source_path, validate_managed_path,
+    AppPaths, PathPolicyError, APPROVED_BASE, validate_application_resource_path,
+    validate_import_source_path, validate_managed_path,
 )
 
 
@@ -58,6 +59,19 @@ class PathsTests(unittest.TestCase):
             self.assertTrue(Path(environment[name]).is_relative_to(self.root))
             self.assertTrue(Path(environment[name]).is_dir())
         self.assertEqual(original, {name: os.environ.get(name) for name in original})
+
+    def test_c_resources_allow_only_the_exact_installation_root(self):
+        installation = Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'MathModelPaperStudio'
+        resource = installation / '_internal' / 'computation-runtime' / 'python.exe'
+        self.assertEqual(resource, validate_application_resource_path(resource))
+        for path in (str(installation) + '-other\\python.exe',
+                     str(installation) + r'\..\outside\python.exe',
+                     r'C:\unapproved-mathmodel-installation\python.exe',
+                     r'\\server\share\MathModelPaperStudio\python.exe'):
+            with self.subTest(path=path), self.assertRaises(PathPolicyError):
+                validate_application_resource_path(path)
+        with self.assertRaises(PathPolicyError):
+            AppPaths(installation / 'data')
 
     def test_ensure_rechecks_junction_escape_before_writing(self):
         paths = AppPaths(self.root)

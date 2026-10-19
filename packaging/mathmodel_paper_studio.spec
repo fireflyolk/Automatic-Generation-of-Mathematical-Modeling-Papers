@@ -17,9 +17,13 @@ computation_runtime = validate_managed_path(Path(os.environ["MMPS_COMPUTATION_RU
 runtime_manifest_path = validate_managed_path(computation_runtime / "runtime-manifest.json")
 runtime_python = validate_managed_path(computation_runtime / "python.exe")
 runtime_entry = validate_managed_path(computation_runtime / "sandbox_entry.py")
+source_runtime_entry = validate_managed_path(project / "packaging" / "runtime" / "sandbox_entry.py")
 runtime_lock = validate_managed_path(project / "requirements-execution.lock")
 if not all(path.is_file() for path in (runtime_manifest_path, runtime_python, runtime_entry)):
     raise ValueError("The locked F: computation runtime is incomplete")
+if hashlib.sha256(runtime_entry.read_bytes()).digest() != hashlib.sha256(
+        source_runtime_entry.read_bytes()).digest():
+    raise ValueError("The computation runtime Sandbox launcher differs from the current host protocol")
 runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
 lock_digest = hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
 required_runtime_packages = {"numpy", "pandas", "scipy", "matplotlib", "python-docx",
@@ -32,10 +36,10 @@ hook = build_root / "runtime_f_drive.py"
 hook.write_text(
     "import sys, ctypes\n"
     "from pathlib import Path\n"
-    "from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_path\n"
+    "from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_application_resource_path\n"
     "try:\n"
-    "    validate_managed_path(Path(sys.executable))\n"
-    "    validate_managed_path(Path(sys._MEIPASS))\n"
+    "    validate_application_resource_path(Path(sys.executable))\n"
+    "    validate_application_resource_path(Path(sys._MEIPASS))\n"
     "    root = sys.argv[sys.argv.index('--root') + 1] if '--root' in sys.argv else None\n"
     "    paths = AppPaths(root) if root is not None else AppPaths()\n"
     "    paths.configure_environment()\n"
@@ -53,7 +57,7 @@ a = Analysis(
            (str(computation_runtime), "computation-runtime")],
     hiddenimports=collect_submodules("mathmodel_paper_studio") + ["qfluentwidgets._rc.resource", "qframelesswindow._rc.resource"],
     hookspath=[], hooksconfig={}, runtime_hooks=[str(hook)],
-    excludes=["tests", "pytest", "coverage", "pip", "setuptools", "docx",
+    excludes=["tests", "pytest", "coverage", "pip", "setuptools",
               "tkinter", "numpy", "scipy", "matplotlib"],
     noarchive=False,
 )
