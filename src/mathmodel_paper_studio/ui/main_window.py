@@ -44,7 +44,7 @@ from mathmodel_paper_studio.execution.windows_sandbox import (
     resolve_computation_runtime_root,
 )
 from mathmodel_paper_studio.paper.docx_qa import DocxQaReport, run_docx_qa
-from mathmodel_paper_studio.paper.standards import get_default_paper_standard
+from mathmodel_paper_studio.paper.standards import get_default_paper_standard, get_paper_standard
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.projects.manifest import latest_manifest
@@ -1291,12 +1291,16 @@ class MainWindow(FluentWindow):
                     raise ValueError('论文模板哈希与本次清单不一致。')
                 mapping = TemplateMapping.from_dict(manifest['mapping'])
                 mapping.validate_for(inspection)
-                standard = get_default_paper_standard()
                 standard_record = manifest.get('paper_standard', {})
-                if (standard_record.get('standard_id') != standard.standard_id
-                        or standard_record.get('version') != standard.version
-                        or standard_record.get('sha256') != standard.sha256):
-                    review_items.append('论文规范版本与当前内置版本不同；已按清单记录的 DOCX 结构继续检查。')
+                if not isinstance(standard_record, dict):
+                    standard_record = {}
+                standard = get_paper_standard(
+                    standard_record.get('standard_id'), standard_record.get('version'),
+                    standard_record.get('sha256'),
+                )
+                if standard is None:
+                    standard = get_default_paper_standard()
+                    review_items.append('论文规范档案版本无法解析；已按当前规范检查文档结构，未验证历史质量目标。')
                 expected_evidence = manifest.get('expected_evidence_ids', [])
                 report = run_docx_qa(
                     paper_path, inspection, mapping,
@@ -1307,6 +1311,8 @@ class MainWindow(FluentWindow):
                     standard_sections=manifest.get('standard_sections_included', ()),
                     keyword_count=manifest.get('keyword_count'),
                     expected_equation_count=manifest.get('equation_count'),
+                    expected_flowchart_count=manifest.get('flowchart_count'),
+                    content_character_count=manifest.get('content_character_count'),
                     pending_references=manifest.get('pending_references', ()),
                 )
             except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
@@ -1374,9 +1380,14 @@ class MainWindow(FluentWindow):
             lines.extend(f'{label}\uff1a{"; ".join(values)}' for label, values in groups if values)
             if report.standard_id is not None:
                 lines.append(f'论文规范：{report.standard_id} {report.standard_version}（SHA-256 {report.standard_sha256}）')
-                lines.append(f'篇幅目标：约 {report.target_pages} 页；实际页数：'
+                if report.minimum_pages is not None and report.maximum_pages is not None:
+                    page_target = f'{report.minimum_pages}–{report.maximum_pages} 页（中心 {report.target_pages} 页）'
+                else:
+                    page_target = f'约 {report.target_pages} 页'
+                lines.append(f'篇幅目标：{page_target}；实际页数：'
                              f'{report.actual_pages if report.actual_pages is not None else "未渲染，未知"}')
                 lines.append(f'公式对象数：{report.equation_count}；编号检查：{report.caption_numbering_status}')
+                lines.append(f'结构化流程图数：{report.flowchart_count}；正文字符数：{report.content_character_count:,}')
         lines.extend(f'\u590d\u6838\u9879\uff1a{item}' for item in review_items)
         lines.append('\u6570\u5b66\u7ed3\u8bba\u548c\u6570\u503c\u5c1a\u672a\u72ec\u7acb\u9a8c\u8bc1\uff0c\u8bf7\u4eba\u5de5\u590d\u6838\u3002')
         lines.append('Word \u9875\u9762\u6e32\u67d3\uff1a\u672a\u6267\u884c\u3002')

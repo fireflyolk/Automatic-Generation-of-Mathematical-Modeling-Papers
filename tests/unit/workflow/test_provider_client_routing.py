@@ -5,11 +5,34 @@ from types import SimpleNamespace
 
 from mathmodel_paper_studio.agents.preflight import AdapterCapabilities, Provider, ProviderStatus
 from mathmodel_paper_studio.domain.models import Stage, StageStatus
-from mathmodel_paper_studio.workflow.live_engine import LiveWorkflowEngine
+from mathmodel_paper_studio.agents.providers.deepseek_api import _SafeClientError
+from mathmodel_paper_studio.workflow.live_engine import LiveWorkflowEngine, _stage_failure_diagnostic
 from mathmodel_paper_studio.workflow.provider_clients import ProviderClientRegistry
 
 
 class ProviderClientRoutingTests(unittest.TestCase):
+    def test_stage_diagnostics_expose_only_allowlisted_provider_failure_codes(self):
+        safe_error = _SafeClientError('private response body', diagnostic_code='http_402')
+
+        self.assertEqual(
+            _stage_failure_diagnostic(safe_error),
+            'DeepSeek API 拒绝请求（HTTP 402）；请检查账户额度和服务状态。',
+        )
+        self.assertNotIn('private response body', _stage_failure_diagnostic(safe_error))
+
+        content_filter_error = _SafeClientError(
+            'private response body', diagnostic_code='content_filtered')
+        self.assertEqual(
+            _stage_failure_diagnostic(content_filter_error),
+            'DeepSeek 服务商因内容过滤未完成生成；部分结果已丢弃。',
+        )
+
+        unsafe_error = _SafeClientError('private response body', diagnostic_code='private response body')
+        self.assertEqual(
+            _stage_failure_diagnostic(unsafe_error),
+            'DeepSeek API 请求未完成；服务商响应未保存。',
+        )
+
     def test_registry_routes_codex_and_deepseek_independently(self):
         codex = object()
         deepseek = object()
@@ -83,7 +106,8 @@ class ProviderClientRoutingTests(unittest.TestCase):
                 provider=provider, stage=Stage.PROBLEM_DECOMPOSITION,
                 upstream_artifacts=(), authorized_problem='fixture problem',
                 problem_evidence_id='problem-evidence', inputs=(),
-                system_instructions='', trust_notice='',
+                system_instructions='', trust_notice='', paper_standard_id=None,
+                paper_standard_version=None, paper_standard_sha256=None,
             )
             self.assertEqual({'subproblems': [expected]},
                              engine._request(context, {'subproblems'}, {}))

@@ -27,8 +27,10 @@ def _application():
 
 def _models():
     return (
-        DeepSeekModelInfo('deepseek-flash', 'DeepSeek Flash', ('low', 'high', 'max'), 'high'),
-        DeepSeekModelInfo('deepseek-v4-pro', 'DeepSeek Pro', ('low', 'high', 'max'), 'high'),
+        DeepSeekModelInfo('deepseek-flash', 'DeepSeek Flash', ('low', 'high', 'max'), 'high',
+                          max_output_tokens=12_288),
+        DeepSeekModelInfo('deepseek-v4-pro', 'DeepSeek Pro', ('low', 'high', 'max'), 'high',
+                          max_output_tokens=16_384),
     )
 
 
@@ -54,7 +56,8 @@ def test_dialog_selects_model_and_effort_and_persists_choice():
         dialog.effort_combo.setCurrentIndex(3)
         dialog.save_button.click()
 
-        assert store.load() == DeepSeekModelPreference('deepseek-v4-pro', 'max')
+        assert store.load() == DeepSeekModelPreference(
+            'deepseek-v4-pro', 'max', max_output_tokens=16_384)
         assert dialog.result() == dialog.DialogCode.Accepted
     finally:
         temporary.cleanup()

@@ -19,9 +19,12 @@ from mathmodel_paper_studio.agents.preflight import (
 )
 from mathmodel_paper_studio.agents.deepseek_model_catalog import parse_model_catalog
 from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    APPLICATION_MAX_OUTPUT_TOKENS,
+    DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEFAULT_DEEPSEEK_EFFORT,
     DEFAULT_DEEPSEEK_MODEL,
     DeepSeekModelPreference,
+    deepseek_output_token_limits,
 )
 from mathmodel_paper_studio.agents.protocol import AgentEvent, EventKind
 from mathmodel_paper_studio.agents.process_runner import _Redactor
@@ -34,11 +37,22 @@ _HOST = 'api.deepseek.com'
 _PATH = '/chat/completions'
 _MODELS_PATH = '/models'
 _PORT = 443
+# Model-catalog reads should stay quick; model generation can spend materially
+# longer in provider-side reasoning, especially with reasoning_effort=max.
 _REQUEST_TIMEOUT_SECONDS = 45.0
+# Long-form paper batches need more wall time than the ordinary 8K responses.
+_GENERATION_TIMEOUT_SECONDS = 1800.0
+_MAX_STREAM_LINE_BYTES = 64 * 1024
+_HTTP_DIAGNOSTIC_STATUSES = frozenset({
+    400, 401, 402, 403, 404, 408, 413, 422, 429, 500, 502, 503, 504,
+})
 _MAX_PROMPT_BYTES = 900 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# SSE repeats the JSON envelope for each token, including ignored reasoning.
+# Its transport budget is separate from the bounded final answer and JSON body.
+_MAX_STREAM_RESPONSE_BYTES = 128 * 1024 * 1024
 _MAX_RESULT_BYTES = 1024 * 1024
-_MAX_OUTPUT_TOKENS = 8192
+_MAX_OUTPUT_TOKENS = APPLICATION_MAX_OUTPUT_TOKENS
 _MAX_JSON_NODES = 12000
 _KEY_PATTERN = re.compile(r'^[\x21-\x7e]{1,4096}$')
 _SYSTEM_RULES = (
@@ -85,6 +99,20 @@ def _environment_key():
 
 class _SafeClientError(ValueError):
     """An application-authored error that contains no provider or secret text."""
+
+    _DIAGNOSTIC_CODES = frozenset({
+        'request_timeout', 'network_error', 'http_400', 'http_401', 'http_402',
+        'http_403', 'http_404', 'http_408', 'http_413', 'http_422', 'http_429',
+        'http_500', 'http_502', 'http_503', 'http_504', 'http_other',
+        'incomplete_response', 'content_filtered', 'output_limit', 'invalid_response',
+        'missing_api_key', 'request_failed',
+    })
+
+    def __init__(self, message, *, diagnostic_code='request_failed'):
+        super().__init__(message)
+        self.diagnostic_code = (diagnostic_code if isinstance(diagnostic_code, str)
+                                and diagnostic_code in self._DIAGNOSTIC_CODES
+                                else 'request_failed')
 
 
 class _SafeRuntimeError(RuntimeError):
@@ -225,7 +253,8 @@ class ExternalProcessingScope:
 
 
 def _invalid_response():
-    return _SafeClientError('DeepSeek 响应格式无效或超过安全上限。')
+    return _SafeClientError('DeepSeek 响应格式无效或超过安全上限。',
+                            diagnostic_code='invalid_response')
 
 
 def _unique_object(pairs):
@@ -529,7 +558,7 @@ class DeepSeekApiClient:
         return preference
 
     def generate(self, context, prompt, cancel_event=None):
-        return self._generate(context, prompt, cancel_event)
+        return self._generate_with_output_retry(context, prompt, cancel_event)
 
     def generate_with_progress(self, context, prompt, cancel_event=None, *, event_callback):
         run_id, _, _, _ = _validate_context(context)
@@ -550,7 +579,8 @@ class DeepSeekApiClient:
             emit(EventKind.STARTED)
 
         try:
-            content = self._generate(context, prompt, cancel_event, on_request_sent=request_sent)
+            content = self._generate_with_output_retry(
+                context, prompt, cancel_event, on_request_sent=request_sent)
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
             if not self._is_authorized(run_id):
@@ -568,7 +598,33 @@ class DeepSeekApiClient:
                 emit(EventKind.FAILED)
             raise
 
-    def _generate(self, context, prompt, cancel_event=None, *, on_request_sent=None):
+    def _generate_with_output_retry(self, context, prompt, cancel_event=None, *,
+                                    on_request_sent=None):
+        try:
+            return self._generate(
+                context, prompt, cancel_event, on_request_sent=on_request_sent)
+        except _SafeClientError as exc:
+            if exc.diagnostic_code != 'output_limit':
+                raise
+            first_error = exc
+
+        run_id, _, _, _ = _validate_context(context)
+        if cancel_event is not None and cancel_event.is_set():
+            raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
+        preference = self.authorized_model_preference(run_id)
+        if preference is None:
+            raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。')
+        first_limit, retry_limit = deepseek_output_token_limits(preference)
+        if retry_limit <= first_limit:
+            raise first_error
+        return self._generate(
+            context, prompt, cancel_event,
+            on_request_sent=on_request_sent,
+            max_output_tokens=retry_limit,
+        )
+
+    def _generate(self, context, prompt, cancel_event=None, *, on_request_sent=None,
+                  max_output_tokens=None):
         run_id, _, rules, trust_notice = _validate_context(context)
         prompt_bytes = _validate_prompt(prompt)
         if cancel_event is not None and not callable(getattr(cancel_event, 'is_set', None)):
@@ -591,20 +647,35 @@ class DeepSeekApiClient:
         monitor_stop = threading.Event()
         timed_out = threading.Event()
         monitor = None
-        deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+        deadline = time.monotonic() + _GENERATION_TIMEOUT_SECONDS
         try:
             key = self._resolve_key()
             if key is None:
-                raise _SafeClientError('未检测到有效的 DEEPSEEK_API_KEY 环境变量。')
+                raise _SafeClientError('未检测到有效的 DEEPSEEK_API_KEY 环境变量。',
+                                       diagnostic_code='missing_api_key')
             if key in prompt_bytes.decode('utf-8') or key in rules or key in trust_notice:
                 raise _SafeClientError('请求内容疑似包含本机 API 凭据，已阻止发送。')
+            output_limit = (
+                deepseek_output_token_limits(preference)[0]
+                if max_output_tokens is None else max_output_tokens
+            )
+            if (type(output_limit) is not int
+                    or not 1 <= output_limit <= min(preference.max_output_tokens,
+                                                    _MAX_OUTPUT_TOKENS)):
+                raise _SafeRuntimeError('DeepSeek 输出上限无效；请求已停止。')
             body = self._request_body(
                 prompt_bytes, rules, trust_notice, preference.model, preference.effort,
+                output_limit,
             )
+            if key.encode('ascii') in body:
+                raise _SafeClientError('请求内容疑似包含本机 API 凭据，已阻止发送。')
             tls_context = ssl.create_default_context()
             if tls_context.verify_mode != ssl.CERT_REQUIRED or not tls_context.check_hostname:
                 raise _SafeClientError('DeepSeek TLS 证书验证未启用。')
-            connection = self._new_connection(tls_context, abort_event, deadline, run_id)
+            connection = self._new_connection(
+                tls_context, abort_event, deadline, run_id,
+                timeout_seconds=_GENERATION_TIMEOUT_SECONDS,
+            )
             with self._lock:
                 if self._authorized_run_id != run_id:
                     raise _SafeRuntimeError('DeepSeek 运行授权已撤销。')
@@ -618,7 +689,7 @@ class DeepSeekApiClient:
             headers = {
                 'Authorization': 'Bearer ' + key,
                 'Content-Type': 'application/json',
-                'Accept': 'application/json',
+                'Accept': 'text/event-stream',
                 'Content-Length': str(len(body)),
             }
             connection.request('POST', _PATH, body=body, headers=headers)
@@ -633,21 +704,30 @@ class DeepSeekApiClient:
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销。')
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。')
+                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。',
+                                       diagnostic_code='request_timeout')
             self._set_socket_timeout(connection, remaining)
             response = connection.getresponse()
             status = getattr(response, 'status', None)
             if type(status) is not int or status != 200:
                 # http.client never follows redirects; treat every 3xx as failure.
-                raise _SafeClientError('DeepSeek 服务未完成请求。')
-            raw = response.read(_MAX_RESPONSE_BYTES + 1)
-            if not isinstance(raw, bytes) or len(raw) > _MAX_RESPONSE_BYTES:
-                raise _invalid_response()
+                code = (f'http_{status}' if status in _HTTP_DIAGNOSTIC_STATUSES
+                        else 'http_other')
+                raise _SafeClientError('DeepSeek 服务未完成请求。', diagnostic_code=code)
+            get_header = getattr(response, 'getheader', None)
+            content_type = get_header('Content-Type', '') if callable(get_header) else ''
+            if (isinstance(content_type, str)
+                    and content_type.split(';', 1)[0].strip().lower() == 'text/event-stream'):
+                content = self._extract_stream_content(response)
+            else:
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+                if not isinstance(raw, bytes) or len(raw) > _MAX_RESPONSE_BYTES:
+                    raise _invalid_response()
+                content = self._extract_content(raw)
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消。')
             if not self._is_authorized(run_id):
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销。')
-            content = self._extract_content(raw)
             if key in content:
                 raise _SafeClientError('DeepSeek 响应疑似包含本机 API 凭据，已丢弃。')
             if cancel_event is not None and cancel_event.is_set():
@@ -655,18 +735,27 @@ class DeepSeekApiClient:
             if not self._is_authorized(run_id):
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。')
             if timed_out.is_set():
-                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。')
+                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。',
+                                       diagnostic_code='request_timeout')
             return content
         except (_SafeClientError, _SafeRuntimeError):
             raise
-        except Exception:
+        except Exception as exc:
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。') from None
             if timed_out.is_set() or time.monotonic() >= deadline:
-                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。') from None
+                raise _SafeClientError('DeepSeek 请求超时，部分结果已丢弃。',
+                                       diagnostic_code='request_timeout') from None
             if not self._is_authorized(run_id):
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。') from None
-            raise _SafeClientError('DeepSeek 请求失败，服务商响应未保存。') from None
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                diagnostic_code = 'request_timeout'
+            elif isinstance(exc, (OSError, http.client.HTTPException, ssl.SSLError)):
+                diagnostic_code = 'network_error'
+            else:
+                diagnostic_code = 'request_failed'
+            raise _SafeClientError('DeepSeek 请求失败，服务商响应未保存。',
+                                   diagnostic_code=diagnostic_code) from None
         finally:
             monitor_stop.set()
             if monitor is not None:
@@ -686,7 +775,8 @@ class DeepSeekApiClient:
 
     @staticmethod
     def _request_body(prompt_bytes, rules, trust_notice, model=MODEL,
-                      effort=DEFAULT_DEEPSEEK_EFFORT):
+                      effort=DEFAULT_DEEPSEEK_EFFORT,
+                      max_output_tokens=DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS):
         try:
             user_content = prompt_bytes.decode('utf-8', errors='strict')
             system_content = _SYSTEM_RULES + rules + '\n' + trust_notice
@@ -696,8 +786,8 @@ class DeepSeekApiClient:
                     {'role': 'system', 'content': system_content},
                     {'role': 'user', 'content': user_content},
                 ],
-                'stream': False,
-                'max_tokens': _MAX_OUTPUT_TOKENS,
+                'stream': True,
+                'max_tokens': min(max_output_tokens, _MAX_OUTPUT_TOKENS),
                 'reasoning_effort': effort,
             }
             body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
@@ -719,15 +809,16 @@ class DeepSeekApiClient:
         return key
 
     def _new_connection(self, tls_context, abort_event, deadline, run_id,
-                        authorization_check=None):
+                        authorization_check=None,
+                        timeout_seconds=_REQUEST_TIMEOUT_SECONDS):
         if self._transport_factory is not None:
-            return self._transport_factory(_HOST, _PORT, _REQUEST_TIMEOUT_SECONDS, tls_context)
+            return self._transport_factory(_HOST, _PORT, timeout_seconds, tls_context)
         if authorization_check is None:
             authorization_check = lambda: self._is_authorized(run_id)
         return _CancellableHTTPSConnection(
             _HOST,
             _PORT,
-            timeout=_REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             context=tls_context,
             abort_event=abort_event,
             deadline=deadline,
@@ -773,6 +864,125 @@ class DeepSeekApiClient:
             return self._authorized_run_id == run_id
 
     @staticmethod
+    def _extract_stream_content(response):
+        read_chunk = getattr(response, 'read1', None)
+        if not callable(read_chunk):
+            raise _invalid_response()
+        pending = bytearray()
+        event_data = []
+        content_parts = []
+        response_bytes = 0
+        result_bytes = 0
+        finished = False
+        finish_reason = None
+
+        def consume_event():
+            nonlocal result_bytes, finished, finish_reason
+            if not event_data:
+                return
+            data = b'\n'.join(event_data)
+            event_data.clear()
+            if data == b'[DONE]':
+                finished = True
+                return
+            try:
+                payload = json.loads(
+                    data.decode('utf-8', errors='strict'),
+                    object_pairs_hook=_unique_object,
+                    parse_constant=_reject_constant,
+                )
+                _bounded_tree(payload)
+                _reject_tool_calls(payload)
+            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                raise _invalid_response() from None
+            if type(payload) is not dict:
+                raise _invalid_response()
+            choices = payload.get('choices')
+            if type(choices) is not list or len(choices) != 1 or type(choices[0]) is not dict:
+                raise _invalid_response()
+            choice = choices[0]
+            delta = choice.get('delta')
+            if type(delta) is not dict:
+                raise _invalid_response()
+            thought = delta.get('reasoning_content')
+            if thought is not None and not isinstance(thought, str):
+                raise _invalid_response()
+            piece = delta.get('content')
+            if piece is not None:
+                if not isinstance(piece, str) or '\0' in piece:
+                    raise _invalid_response()
+                result_bytes += len(piece.encode('utf-8'))
+                if result_bytes > _MAX_RESULT_BYTES:
+                    raise _invalid_response()
+                content_parts.append(piece)
+            reason = choice.get('finish_reason')
+            if reason is not None:
+                if not isinstance(reason, str) or not reason or len(reason) > 64:
+                    raise _invalid_response()
+                finish_reason = reason
+                if reason in ('tool_calls', 'function_call'):
+                    raise _invalid_response()
+
+        def consume_line(line):
+            if line.endswith(b'\r'):
+                line = line[:-1]
+            if len(line) > _MAX_STREAM_LINE_BYTES:
+                raise _invalid_response()
+            if not line:
+                consume_event()
+            elif line.startswith(b':'):
+                return
+            elif line.startswith(b'data:'):
+                value = line[5:]
+                if value.startswith(b' '):
+                    value = value[1:]
+                event_data.append(value)
+
+        while not finished:
+            chunk = read_chunk(8192)
+            if not isinstance(chunk, bytes):
+                raise _invalid_response()
+            if not chunk:
+                break
+            response_bytes += len(chunk)
+            if response_bytes > _MAX_STREAM_RESPONSE_BYTES:
+                raise _invalid_response()
+            pending.extend(chunk)
+            while True:
+                newline = pending.find(b'\n')
+                if newline < 0:
+                    if len(pending) > _MAX_STREAM_LINE_BYTES:
+                        raise _invalid_response()
+                    break
+                line = bytes(pending[:newline])
+                del pending[:newline + 1]
+                consume_line(line)
+                if finished:
+                    break
+
+        if not finished and pending:
+            consume_line(bytes(pending))
+        if not finished and event_data:
+            consume_event()
+        if not finished:
+            raise _invalid_response()
+        if finish_reason == 'length':
+            raise _SafeClientError('DeepSeek 输出达到本次 token 上限。',
+                                   diagnostic_code='output_limit')
+        if finish_reason == 'content_filter':
+            raise _SafeClientError('DeepSeek 内容过滤未完成生成。',
+                                   diagnostic_code='content_filtered')
+        if finish_reason != 'stop':
+            raise _SafeClientError('DeepSeek 服务未完成生成。',
+                                   diagnostic_code='incomplete_response')
+        if finish_reason is None:
+            raise _invalid_response()
+        content = ''.join(content_parts)
+        if not content.strip():
+            raise _invalid_response()
+        return content
+
+    @staticmethod
     def _extract_content(raw):
         try:
             text = raw.decode('utf-8', errors='strict')
@@ -788,13 +998,27 @@ class DeepSeekApiClient:
             message = choice.get('message')
             if type(message) is not dict or message.get('role') != 'assistant':
                 raise _invalid_response()
-            if choice.get('finish_reason') in ('tool_calls', 'function_call'):
+            finish_reason = choice.get('finish_reason')
+            if not isinstance(finish_reason, str) or not finish_reason:
                 raise _invalid_response()
+            if finish_reason in ('tool_calls', 'function_call'):
+                raise _invalid_response()
+            if finish_reason == 'length':
+                raise _SafeClientError('DeepSeek 输出达到本次 token 上限。',
+                                       diagnostic_code='output_limit')
+            if finish_reason == 'content_filter':
+                raise _SafeClientError('DeepSeek 内容过滤未完成生成。',
+                                       diagnostic_code='content_filtered')
+            if finish_reason != 'stop':
+                raise _SafeClientError('DeepSeek 服务未完成生成。',
+                                       diagnostic_code='incomplete_response')
             content = message.get('content')
             if not isinstance(content, str) or not content.strip() or '\0' in content:
                 raise _invalid_response()
             if len(content.encode('utf-8')) > _MAX_RESULT_BYTES:
                 raise _invalid_response()
             return content
+        except _SafeClientError:
+            raise
         except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
             raise _invalid_response() from None

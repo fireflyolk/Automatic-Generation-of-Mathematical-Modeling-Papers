@@ -1,5 +1,5 @@
 """Canonical, versioned paper-writing standards shared by the workflow."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from types import MappingProxyType
@@ -33,6 +33,11 @@ class PaperStandard:
     content_rules: Mapping[str, str]
     style_defaults: Mapping[str, str]
     stage_rules: Mapping[str, tuple[str, ...]]
+    minimum_pages: int | None = None
+    maximum_pages: int | None = None
+    target_body_characters: int | None = None
+    recommended_equation_count: int | None = None
+    recommended_flowchart_count: int | None = None
 
     def __post_init__(self):
         for name in ('standard_id', 'version', 'display_name'):
@@ -41,6 +46,21 @@ class PaperStandard:
                 raise ValueError(f'{name} is invalid.')
         if type(self.target_pages) is not int or not 1 <= self.target_pages <= 500:
             raise ValueError('target_pages must be between 1 and 500.')
+        page_bounds = (self.minimum_pages, self.maximum_pages)
+        if any(value is not None and (type(value) is not int or not 1 <= value <= 500)
+               for value in page_bounds):
+            raise ValueError('Page range bounds are invalid.')
+        if (self.minimum_pages is not None and self.maximum_pages is not None
+                and self.minimum_pages > self.maximum_pages):
+            raise ValueError('Minimum pages must not exceed maximum pages.')
+        bounded_targets = (
+            (self.target_body_characters, 0, 1_000_000),
+            (self.recommended_equation_count, 0, 256),
+            (self.recommended_flowchart_count, 0, 64),
+        )
+        if any(value is not None and (type(value) is not int or not low <= value <= high)
+               for value, low, high in bounded_targets):
+            raise ValueError('Paper content targets are invalid.')
         for name in ('required_sections', 'optional_sections'):
             values = getattr(self, name)
             if not isinstance(values, (tuple, list)) or len(values) > 64:
@@ -82,7 +102,7 @@ class PaperStandard:
         return '\n'.join(lines)
 
     def _canonical_object(self) -> dict:
-        return {
+        payload = {
             'standard_id': self.standard_id,
             'version': self.version,
             'display_name': self.display_name,
@@ -93,6 +113,15 @@ class PaperStandard:
             'style_defaults': dict(self.style_defaults),
             'stage_rules': {key: list(value) for key, value in self.stage_rules.items()},
         }
+        extended = {
+            'minimum_pages': self.minimum_pages,
+            'maximum_pages': self.maximum_pages,
+            'target_body_characters': self.target_body_characters,
+            'recommended_equation_count': self.recommended_equation_count,
+            'recommended_flowchart_count': self.recommended_flowchart_count,
+        }
+        payload.update({key: value for key, value in extended.items() if value is not None})
+        return payload
 
     def canonical_payload(self) -> bytes:
         return json.dumps(self._canonical_object(), ensure_ascii=False, sort_keys=True,
@@ -106,7 +135,7 @@ class PaperStandard:
         return hash(self.sha256)
 
 
-_DEFAULT_STANDARD = PaperStandard(
+_LEGACY_STANDARD = PaperStandard(
     standard_id='b078-competition-v1',
     version='1.0.0',
     display_name='B078 数模论文规范',
@@ -160,10 +189,51 @@ _DEFAULT_STANDARD = PaperStandard(
     },
 )
 
+_DEFAULT_STANDARD = replace(
+    _LEGACY_STANDARD,
+    version='1.1.0',
+    target_pages=45,
+    content_rules={
+        **dict(_LEGACY_STANDARD.content_rules),
+        'mathematics': (
+            '给出模型变量、单位、假设、目标和约束；按逻辑顺序推导关键公式，逐一解释符号、假设来源和适用范围；'
+            '用公式对象表达模型、算法和验证指标，建议至少 12 个有实际作用的可编辑公式，不拆分或重复表达式凑数。'
+        ),
+        'figures_tables': (
+            '公式、图表连续编号且标题贴近对象；结果图必须来自已验证运行产物。按题目需要规划 3–5 张流程图，'
+            '流程图仅表达可核对的研究步骤、模型关系、求解过程或验证路径；每张图后写清节点、分支条件和结论含义。'
+            '不能重复图表来填充篇幅。'
+        ),
+        'length': (
+            '论文目标 40–50 页，规划中心为 45 页，并力争约 50,000 个有实质内容的正文字符；'
+            '通过题目分析、推导、求解、证据解释和复现说明形成篇幅，不插入空白页、重复段落、无关内容或虚构结果。'
+            '题目或证据不足时如实报告缺口，不以内容数量作为工作流暂停条件。'
+        ),
+    },
+    minimum_pages=40,
+    maximum_pages=50,
+    target_body_characters=50_000,
+    recommended_equation_count=12,
+    recommended_flowchart_count=3,
+)
+
+_STANDARD_REGISTRY = {
+    (_LEGACY_STANDARD.standard_id, _LEGACY_STANDARD.version): _LEGACY_STANDARD,
+    (_DEFAULT_STANDARD.standard_id, _DEFAULT_STANDARD.version): _DEFAULT_STANDARD,
+}
+
 
 def get_default_paper_standard() -> PaperStandard:
-    """Return the built-in B078 profile; the frozen instance is safe to share."""
+    """Return the current built-in profile; the frozen instance is safe to share."""
     return _DEFAULT_STANDARD
+
+
+def get_paper_standard(standard_id: str, version: str, sha256: str) -> PaperStandard | None:
+    """Resolve an archived profile only when its id, version, and digest agree."""
+    if any(not isinstance(value, str) or not value for value in (standard_id, version, sha256)):
+        return None
+    selected = _STANDARD_REGISTRY.get((standard_id, version))
+    return selected if selected is not None and selected.sha256 == sha256 else None
 
 
 def canonical_payload(standard: PaperStandard | None = None) -> bytes:

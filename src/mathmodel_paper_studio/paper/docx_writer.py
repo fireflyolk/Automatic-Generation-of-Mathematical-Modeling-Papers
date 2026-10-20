@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import struct
 from uuid import uuid4
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 import xml.etree.ElementTree as ET
@@ -161,6 +162,9 @@ class FigureDraft:
     caption: str
     evidence_ids: tuple[str, ...] = ()
     pending_reviews: tuple[str, ...] = ()
+    visual_type: str = 'result'
+    explanation: str = ''
+    visual_id: str = ''
 
     def __post_init__(self):
         _text(self.caption)
@@ -175,6 +179,16 @@ class FigureDraft:
             raise DocxWriteError('JPEG figure signature is invalid.')
         object.__setattr__(self, 'evidence_ids', _evidence_ids(self.evidence_ids))
         object.__setattr__(self, 'pending_reviews', tuple(_text(item) for item in self.pending_reviews))
+        if self.visual_type not in ('result', 'flowchart'):
+            raise DocxWriteError('Figure visual type is unsupported.')
+        explanation = _text(self.explanation, allow_empty=True)
+        if self.visual_type == 'flowchart' and not explanation:
+            raise DocxWriteError('Flowchart figures require explanatory text.')
+        visual_id = self.visual_id or self.section_key
+        if not isinstance(visual_id, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', visual_id):
+            raise DocxWriteError('Figure visual ID is invalid.')
+        object.__setattr__(self, 'explanation', explanation)
+        object.__setattr__(self, 'visual_id', visual_id)
 
 
 @dataclass(frozen=True)
@@ -221,9 +235,13 @@ class PaperDraft:
             raise DocxWriteError('Paper figures contain an invalid value.')
         if any(not isinstance(item, EquationDraft) for item in self.equations):
             raise DocxWriteError('Paper equations contain an invalid value.')
-        keys = [item.section_key for item in (*self.sections, *self.tables, *self.figures)]
+        mapped_figures = tuple(item for item in self.figures if item.visual_type == 'result')
+        keys = [item.section_key for item in (*self.sections, *self.tables, *mapped_figures)]
         if len(set(keys)) != len(keys):
             raise DocxWriteError('Each draft block requires a distinct mapping key.')
+        visual_ids = [item.visual_id for item in self.figures]
+        if len(set(visual_ids)) != len(visual_ids):
+            raise DocxWriteError('Each figure requires a distinct visual ID.')
         if len(self.pending_references) > 256:
             raise DocxWriteError('Too many pending references.')
         object.__setattr__(self, 'pending_references', tuple(_text(item) for item in self.pending_references))
@@ -274,13 +292,14 @@ def _generic_figure_anchor_title(index: int) -> str:
 
 
 def _append_generic_artifact_anchors(document, draft: PaperDraft) -> None:
+    result_figures = tuple(item for item in draft.figures if item.visual_type == 'result')
     for table_draft in draft.tables:
         document.add_paragraph('{{table_caption:' + table_draft.section_key + '}}', style='Caption')
         table = document.add_table(rows=1, cols=len(table_draft.headers))
         table.style = 'Table Grid'
         for column_index, cell in enumerate(table.rows[0].cells):
             cell.text = '{{table:' + table_draft.section_key + ':' + str(column_index) + '}}'
-    for figure_index, _figure in enumerate(draft.figures, start=1):
+    for figure_index, _figure in enumerate(result_figures, start=1):
         document.add_heading(_generic_figure_anchor_title(figure_index), level=3)
 
 
@@ -356,6 +375,8 @@ def _generic_document_bytes(draft: PaperDraft) -> bytes:
     if not has_abstract:
         document.add_paragraph('{{keywords}}', style='Caption')
     section_keys = {item.section_key for item in ordered_sections}
+    result_figures = tuple(item for item in draft.figures if item.visual_type == 'result')
+    mapped_artifacts_present = bool(draft.tables or result_figures)
     artifact_anchor = next(
         (key for key in ('results', 'solution', 'model', 'problem_analysis')
          if key in section_keys),
@@ -368,7 +389,7 @@ def _generic_document_bytes(draft: PaperDraft) -> bytes:
     ) if artifact_anchor is None else None
     artifacts_added = False
     for item in ordered_sections:
-        if fallback_before == item.section_key and (draft.tables or draft.figures):
+        if fallback_before == item.section_key and mapped_artifacts_present:
             document.add_heading(_numbered_section_title('results') + '（待补正文）', level=1)
             document.add_paragraph('结果正文待补充；请结合下方已验证数据补充分析。')
             _append_generic_artifact_anchors(document, draft)
@@ -377,10 +398,10 @@ def _generic_document_bytes(draft: PaperDraft) -> bytes:
         document.add_paragraph('{{section:' + item.section_key + '}}')
         if item.section_key == 'abstract':
             document.add_paragraph('{{keywords}}', style='Caption')
-        if item.section_key == artifact_anchor and (draft.tables or draft.figures):
+        if item.section_key == artifact_anchor and mapped_artifacts_present:
             _append_generic_artifact_anchors(document, draft)
             artifacts_added = True
-    if (draft.tables or draft.figures) and not artifacts_added:
+    if mapped_artifacts_present and not artifacts_added:
         document.add_heading(_numbered_section_title('results') + '（待补正文）', level=1)
         document.add_paragraph('结果正文待补充；请结合下方已验证数据补充分析。')
         _append_generic_artifact_anchors(document, draft)
@@ -455,7 +476,8 @@ def _generic_template_mapping(template_path: Path, draft: PaperDraft):
     try:
         for item in draft.sections:
             selections[item.section_key] = headings[_numbered_section_title(item.section_key)]
-        for index, item in enumerate(draft.figures, start=1):
+        result_figures = tuple(item for item in draft.figures if item.visual_type == 'result')
+        for index, item in enumerate(result_figures, start=1):
             selections[item.section_key] = headings[_generic_figure_anchor_title(index)]
         for item in draft.tables:
             selections[item.section_key] = next(tables).anchor_id
@@ -719,18 +741,23 @@ def _drawing_paragraph(relationship_id: str, figure: FigureDraft, drawing_id: in
     run = ET.SubElement(paragraph, _W + 'r')
     drawing = ET.SubElement(run, _W + 'drawing')
     inline = ET.SubElement(drawing, _WP + 'inline', {'distT': '0', 'distB': '0', 'distL': '0', 'distR': '0'})
-    ET.SubElement(inline, _WP + 'extent', {'cx': '4572000', 'cy': '3429000'})
+    extent = _figure_extent(figure)
+    ET.SubElement(inline, _WP + 'extent', {'cx': str(extent[0]), 'cy': str(extent[1])})
     evidence = ', '.join(figure.evidence_ids) or 'not linked'
-    ET.SubElement(inline, _WP + 'docPr', {'id': str(drawing_id), 'name': f'figure-{figure.section_key}',
-                                          'descr': f'Evidence: {evidence}'})
+    description = f'Visual type: {figure.visual_type}; Evidence: {evidence}'
+    if figure.explanation:
+        description += '; ' + figure.explanation
+    image_name = f'figure-{figure.visual_id}'
+    ET.SubElement(inline, _WP + 'docPr', {'id': str(drawing_id), 'name': image_name,
+                                          'descr': description})
     frame = ET.SubElement(inline, _WP + 'cNvGraphicFramePr')
     ET.SubElement(frame, _A + 'graphicFrameLocks', {'noChangeAspect': '1'})
     graphic = ET.SubElement(ET.SubElement(inline, _A + 'graphic'), _A + 'graphicData',
                             {'uri': 'http://schemas.openxmlformats.org/drawingml/2006/picture'})
     picture = ET.SubElement(graphic, _PIC + 'pic')
     nv = ET.SubElement(picture, _PIC + 'nvPicPr')
-    ET.SubElement(nv, _PIC + 'cNvPr', {'id': str(drawing_id), 'name': f'figure-{figure.section_key}',
-                                       'descr': f'Evidence: {evidence}'})
+    ET.SubElement(nv, _PIC + 'cNvPr', {'id': str(drawing_id), 'name': image_name,
+                                       'descr': description})
     ET.SubElement(nv, _PIC + 'cNvPicPr')
     fill = ET.SubElement(picture, _PIC + 'blipFill')
     ET.SubElement(fill, _A + 'blip', {_R + 'embed': relationship_id})
@@ -738,10 +765,21 @@ def _drawing_paragraph(relationship_id: str, figure: FigureDraft, drawing_id: in
     shape = ET.SubElement(picture, _PIC + 'spPr')
     transform = ET.SubElement(shape, _A + 'xfrm')
     ET.SubElement(transform, _A + 'off', {'x': '0', 'y': '0'})
-    ET.SubElement(transform, _A + 'ext', {'cx': '4572000', 'cy': '3429000'})
+    ET.SubElement(transform, _A + 'ext', {'cx': str(extent[0]), 'cy': str(extent[1])})
     geometry = ET.SubElement(shape, _A + 'prstGeom', {'prst': 'rect'})
     ET.SubElement(geometry, _A + 'avLst')
     return paragraph
+
+
+def _figure_extent(figure):
+    """Fit PNGs without distortion while keeping figures within a portrait page."""
+    if (figure.image_format == 'png' and len(figure.image_bytes) >= 24
+            and figure.image_bytes.startswith(b'\x89PNG\r\n\x1a\n')):
+        width, height = struct.unpack('>II', figure.image_bytes[16:24])
+        if width > 0 and height > 0:
+            scale = min(5486400 / width, 6858000 / height)
+            return max(1, round(width * scale)), max(1, round(height * scale))
+    return 4572000, 3429000
 
 
 def _add_content_type(root, extension: str, mime_type: str) -> None:
@@ -917,7 +955,14 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
     drawing_id = max(existing_draw_ids, default=0) + 1
     figure_number = 0
     relationship_number = 0
-    for figure in draft.figures:
+    ordered_figures = sorted(
+        enumerate(draft.figures),
+        key=lambda pair: (
+            by_id[_binding_for(mapping, pair[1].section_key, 'heading').anchor_id].index,
+            pair[0],
+        ),
+    )
+    for _, figure in ordered_figures:
         binding = _binding_for(mapping, figure.section_key, 'heading')
         heading = anchor_nodes[binding.anchor_id]
         parent = _all_parents(document).get(heading)
@@ -943,8 +988,12 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
         figure_paragraph = _drawing_paragraph(relationship_id, figure, drawing_id)
         drawing_id += 1
         extras = [figure_paragraph, _styled_paragraph(f'图{figure_number}：{figure.caption}', 'Caption')]
+        if figure.explanation:
+            extras.append(_paragraph(figure.explanation))
         extras.extend(_paragraph(text) for text in _markers(figure.evidence_ids, figure.pending_reviews))
-        _after(parent, heading, extras)
+        tail = section_tails.get(figure.section_key, heading)
+        _after(parent, tail, extras)
+        section_tails[figure.section_key] = extras[-1]
 
     if not any(item.section_key == 'references' for item in draft.sections):
         for pending in draft.pending_references:

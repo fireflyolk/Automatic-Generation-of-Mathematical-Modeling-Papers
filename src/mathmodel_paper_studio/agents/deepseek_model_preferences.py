@@ -1,4 +1,4 @@
-"""F:-only persistence for DeepSeek model and reasoning-effort choices."""
+"""F:-only persistence for the selected DeepSeek model, effort, and output ceiling."""
 from dataclasses import dataclass
 import json
 import os
@@ -11,6 +11,8 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_pa
 
 DEFAULT_DEEPSEEK_MODEL = 'deepseek-flash'
 DEFAULT_DEEPSEEK_EFFORT = 'high'
+DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS = 8192
+APPLICATION_MAX_OUTPUT_TOKENS = 131_072
 SUPPORTED_DEEPSEEK_EFFORTS = ('none', 'low', 'high', 'max')
 _MAX_PREFERENCE_BYTES = 4096
 _MODEL_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$')
@@ -30,11 +32,31 @@ def validate_deepseek_model_id(value):
 class DeepSeekModelPreference:
     model: str
     effort: str
+    # Model-catalog ceiling after the application-level clamp.
+    max_output_tokens: int = DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS
 
     def __post_init__(self):
         validate_deepseek_model_id(self.model)
         if self.effort not in SUPPORTED_DEEPSEEK_EFFORTS:
             raise DeepSeekModelPreferenceError('DeepSeek 推理强度无效。')
+        if (type(self.max_output_tokens) is not int
+                or not 1 <= self.max_output_tokens <= APPLICATION_MAX_OUTPUT_TOKENS):
+            raise DeepSeekModelPreferenceError('DeepSeek 输出 token 上限无效。')
+
+
+def deepseek_output_token_limits(preference: DeepSeekModelPreference) -> tuple[int, int]:
+    """Bound provider-recommended reasoning budgets by the reviewed model ceiling.
+
+    Chat Completions defaults: non-thinking 8K, thinking 64K, max effort 128K.
+    A length retry can double the initial budget once, within the same consent.
+    """
+    if not isinstance(preference, DeepSeekModelPreference):
+        raise TypeError('DeepSeek 生成预算需要已验证的模型设置。')
+    recommended = (DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS if preference.effort == 'none'
+                   else 131_072 if preference.effort == 'max' else 65_536)
+    ceiling = min(preference.max_output_tokens, APPLICATION_MAX_OUTPUT_TOKENS)
+    initial = min(recommended, ceiling)
+    return initial, min(initial * 2, ceiling)
 
 
 def _unique_object(pairs):
@@ -47,7 +69,7 @@ def _unique_object(pairs):
 
 
 class DeepSeekModelPreferenceStore:
-    """Atomically stores only model and effort IDs under app-owned F: state."""
+    """Atomically stores model selection and the catalog output ceiling under F: state."""
 
     def __init__(self, paths: AppPaths):
         if not isinstance(paths, AppPaths):
@@ -74,11 +96,21 @@ class DeepSeekModelPreferenceStore:
             payload = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object)
         except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise DeepSeekModelPreferenceError('DeepSeek 模型设置文件格式无效。') from exc
-        if (type(payload) is not dict or set(payload) != {'schema', 'model', 'effort'}
-                or payload.get('schema') != 1):
+        if type(payload) is not dict:
+            raise DeepSeekModelPreferenceError('DeepSeek 模型设置文件版本或字段无效。')
+        schema = payload.get('schema')
+        expected_fields = (
+            {'schema', 'model', 'effort'} if schema == 1 else
+            {'schema', 'model', 'effort', 'max_output_tokens'} if schema == 2 else None
+        )
+        if expected_fields is None or set(payload) != expected_fields:
             raise DeepSeekModelPreferenceError('DeepSeek 模型设置文件版本或字段无效。')
         try:
-            return DeepSeekModelPreference(model=payload['model'], effort=payload['effort'])
+            return DeepSeekModelPreference(
+                model=payload['model'], effort=payload['effort'],
+                max_output_tokens=payload.get(
+                    'max_output_tokens', DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS),
+            )
         except (KeyError, TypeError, DeepSeekModelPreferenceError) as exc:
             raise DeepSeekModelPreferenceError('DeepSeek 模型或推理强度设置无效。') from exc
 
@@ -88,7 +120,8 @@ class DeepSeekModelPreferenceStore:
         self.paths.ensure_directories()
         path = validate_managed_path(self.path)
         payload = json.dumps(
-            {'schema': 1, 'model': preference.model, 'effort': preference.effort},
+            {'schema': 2, 'model': preference.model, 'effort': preference.effort,
+             'max_output_tokens': preference.max_output_tokens},
             ensure_ascii=False, separators=(',', ':'), allow_nan=False,
         ).encode('utf-8')
         if len(payload) > _MAX_PREFERENCE_BYTES:

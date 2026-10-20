@@ -5,6 +5,7 @@ from qfluentwidgets import BodyLabel, ComboBox, PrimaryPushButton, PushButton, T
 
 from mathmodel_paper_studio.agents.deepseek_model_catalog import DeepSeekModelInfo
 from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    APPLICATION_MAX_OUTPUT_TOKENS,
     DEFAULT_DEEPSEEK_EFFORT,
     DEFAULT_DEEPSEEK_MODEL,
     DeepSeekModelPreference,
@@ -178,9 +179,15 @@ class DeepSeekModelDialog(QDialog):
 
     def _save_preference(self):
         try:
+            selected_model = next(
+                model for model in self._models if model.id == self.model_combo.currentData()
+            )
             preference = DeepSeekModelPreference(
                 model=self.model_combo.currentData(),
                 effort=self.effort_combo.currentData(),
+                max_output_tokens=min(
+                    selected_model.max_output_tokens, APPLICATION_MAX_OUTPUT_TOKENS,
+                ),
             )
             self.preference_store.save(preference)
         except (DeepSeekModelPreferenceError, OSError, ValueError, TypeError) as exc:

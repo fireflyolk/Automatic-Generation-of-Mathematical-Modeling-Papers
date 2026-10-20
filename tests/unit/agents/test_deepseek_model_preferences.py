@@ -5,6 +5,7 @@ import tempfile
 import pytest
 
 from mathmodel_paper_studio.agents.deepseek_model_preferences import (
+    DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS,
     DeepSeekModelPreference,
     DeepSeekModelPreferenceError,
     DeepSeekModelPreferenceStore,
@@ -34,7 +35,7 @@ def test_preference_is_immutable_and_accepts_supported_deepseek_efforts():
         DeepSeekModelPreference('deepseek-flash', 'xhigh')
 
 
-def test_store_round_trips_only_model_and_effort_under_managed_f_state():
+def test_store_round_trips_model_effort_and_output_limit_under_managed_f_state():
     temporary, store = _store()
     try:
         preference = DeepSeekModelPreference('deepseek-v4-pro', 'max')
@@ -43,8 +44,23 @@ def test_store_round_trips_only_model_and_effort_under_managed_f_state():
         assert store.load() == preference
         assert store.path.is_relative_to(store.paths.state)
         assert json.loads(store.path.read_text(encoding='utf-8')) == {
-            'schema': 1, 'model': 'deepseek-v4-pro', 'effort': 'max',
+            'schema': 2, 'model': 'deepseek-v4-pro', 'effort': 'max', 'max_output_tokens': 8192,
         }
+    finally:
+        temporary.cleanup()
+
+
+def test_legacy_preferences_without_catalog_ceiling_use_conservative_output_limit():
+    temporary, store = _store()
+    try:
+        store.paths.ensure_directories()
+        store.path.write_text(json.dumps({
+            'schema': 1, 'model': 'deepseek-flash', 'effort': 'max',
+        }), encoding='utf-8')
+
+        preference = store.load()
+
+        assert preference.max_output_tokens == DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS
     finally:
         temporary.cleanup()
 

@@ -10,6 +10,7 @@ from mathmodel_paper_studio.agents.deepseek_model_preferences import (
 
 _MAX_CATALOG_BYTES = 512 * 1024
 _MAX_MODELS = 256
+_MAX_ADVERTISED_OUTPUT_TOKENS = 393_216
 
 
 class DeepSeekModelCatalogError(ValueError):
@@ -22,6 +23,7 @@ class DeepSeekModelInfo:
     display_name: str
     supported_efforts: tuple[str, ...]
     default_effort: str
+    max_output_tokens: int = 8192
 
     def __post_init__(self):
         try:
@@ -38,6 +40,9 @@ class DeepSeekModelInfo:
             raise DeepSeekModelCatalogError('DeepSeek 模型目录含有无效推理强度。')
         if self.default_effort not in (('none',) + efforts):
             raise DeepSeekModelCatalogError('DeepSeek 模型目录的默认推理强度无效。')
+        if (type(self.max_output_tokens) is not int
+                or not 1 <= self.max_output_tokens <= _MAX_ADVERTISED_OUTPUT_TOKENS):
+            raise DeepSeekModelCatalogError('DeepSeek 模型目录含有无效输出上限。')
 
 
 def _unique_object(pairs):
@@ -129,7 +134,10 @@ def parse_model_catalog(raw):
                     default = requested_default if requested_default in supported else (
                         'high' if 'high' in supported else supported[0]
                     )
-            models.append(DeepSeekModelInfo(model_id, name, supported, default))
+            max_output_tokens = row.get('max_output_tokens', 8192)
+            if max_output_tokens is None:
+                max_output_tokens = 8192
+            models.append(DeepSeekModelInfo(model_id, name, supported, default, max_output_tokens))
         return tuple(models)
     except DeepSeekModelCatalogError:
         raise

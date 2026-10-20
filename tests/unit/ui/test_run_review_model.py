@@ -205,6 +205,16 @@ class RunReviewModelTests(unittest.TestCase):
         self.assertTrue(dialog.start_button.isEnabled())
         self.assertFalse(dialog.start_confirmed)
 
+    def test_deepseek_review_discloses_frozen_output_and_retry_limits(self):
+        preference = DeepSeekModelPreference('deepseek-flash', 'high', 32768)
+        model = self.model(status=deepseek_local_key_status(),
+                           deepseek_model_preference=preference)
+
+        self.assertIn('首次请求上限：32,768 tokens', model.summary_text)
+        self.assertIn('单次输出上限：32,768 tokens', model.summary_text)
+        self.assertIn('长度截断时最多自动重试一次', model.summary_text)
+        self.assertIn('最坏共 32 次请求', model.summary_text)
+
     def test_legacy_claude_status_cannot_be_presented_or_started(self):
         legacy_status = ProviderStatus(
             Provider.CLAUDE, 'claude.exe', '2.1.291', True, None, '能力检查通过。',

@@ -12,7 +12,9 @@ from qfluentwidgets import BodyLabel, CardWidget, FluentIcon, PrimaryPushButton,
 from mathmodel_paper_studio.agents.preflight import Provider, ProviderStatus
 from mathmodel_paper_studio.agents.deepseek_model_preferences import (
     DEFAULT_DEEPSEEK_EFFORT,
+    DEFAULT_DEEPSEEK_MODEL,
     DeepSeekModelPreference,
+    deepseek_output_token_limits,
 )
 from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
 from mathmodel_paper_studio.domain.models import Stage
@@ -151,10 +153,22 @@ class RunReviewModel:
             f'Word 版式：{template_mode}',
             '本次可读取文件：',
         ]
+        if standard.minimum_pages is not None and standard.maximum_pages is not None:
+            lines[4:4] = [
+                f'论文篇幅目标：{standard.minimum_pages}–{standard.maximum_pages} 页，中心目标 {standard.target_pages} 页；需 Word 渲染才能确认页数。',
+                f'内容规划：约 {standard.target_body_characters:,} 字、{standard.recommended_equation_count} 个有效公式、至少 {standard.recommended_flowchart_count} 张流程图；不足时显示建议，不阻断运行。',
+                ('分章起草：最多 8 个分章请求；JSON 格式纠正时每段可能重试一次，'
+                 + ('DeepSeek 长度截断还可能重试一次，最坏共 32 次 Agent 请求。'
+                    if status.provider is Provider.DEEPSEEK else '最坏共 16 次 Agent 请求。')
+                 + '重试会重复计入服务用量；DeepSeek 按实际 token 用量计费。'),
+            ]
         if status.provider is Provider.DEEPSEEK:
             preference = self.deepseek_model_preference
             selected_model = preference.model if preference is not None else status.version
             selected_effort = preference.effort if preference is not None else DEFAULT_DEEPSEEK_EFFORT
+            initial_limit, retry_limit = deepseek_output_token_limits(
+                preference or DeepSeekModelPreference(DEFAULT_DEEPSEEK_MODEL, DEFAULT_DEEPSEEK_EFFORT)
+            )
             lines[2:2] = [
                 f'API 地址与模型：{status.executable or "DeepSeek HTTPS API"} / {selected_model or "未确认"}',
                 f'推理强度：{selected_effort}',
@@ -162,6 +176,9 @@ class RunReviewModel:
                 '文件传输：CSV/XLSX/DOCX 不作为文件附件上传；本适配器只发送工作流生成的文本请求。',
                 '工具与本机权限：无工具调用、文件访问、代码执行或浏览功能。',
                 '费用与外发：点击同意后，请求会发送到 DeepSeek API 并按 token 用量计费；费用取决于实际输入和输出。',
+                f'首次请求上限：{initial_limit:,} tokens；单次输出上限：{retry_limit:,} tokens（含推理与正文），受本次确认的模型目录上限约束。实际只按实际 token 用量计费。',
+                '长度截断时最多自动重试一次；到达本次确认的上限时停止，不保存不完整结果。重试会重复计入服务用量。',
+                '论文阶段最多按 8 段分别发送题目、所选摘要和已验证阶段摘要；JSON 格式纠正时每段可能重试一次，长度截断还可能重试一次，最坏共 32 次请求。多次请求会重复计入实际 token 用量。',
                 '远端连接、API Key 有效性和账户额度尚未验证；首次请求可能失败。',
             ]
         elif status.provider is Provider.CODEX:

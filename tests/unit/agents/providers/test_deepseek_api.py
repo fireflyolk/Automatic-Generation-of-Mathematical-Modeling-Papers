@@ -1,12 +1,14 @@
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from mathmodel_paper_studio.agents.providers import deepseek_api
 from mathmodel_paper_studio.agents.preflight import Provider, UnavailableReason
 from mathmodel_paper_studio.agents.protocol import EventKind
 from mathmodel_paper_studio.agents.deepseek_model_preferences import DeepSeekModelPreference
@@ -23,18 +25,48 @@ API_KEY = 'test-secret-that-must-never-escape'
 
 
 class FakeResponse:
-    def __init__(self, body, status=200):
+    def __init__(self, body, status=200, content_type='application/json', read_chunk_size=None):
         self.body = body if isinstance(body, bytes) else body.encode('utf-8')
         self.status = status
+        self.content_type = content_type
+        self.read_chunk_size = read_chunk_size
+        self.offset = 0
         self.closed = False
+
+    def getheader(self, name, default=None):
+        return self.content_type if name.lower() == 'content-type' else default
 
     def read(self, size=-1):
         if size < 0:
             return self.body
         return self.body[:size]
 
+    def read1(self, size=-1):
+        if size < 0:
+            size = len(self.body) - self.offset
+        if self.read_chunk_size is not None:
+            size = min(size, self.read_chunk_size)
+        chunk = self.body[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
     def close(self):
         self.closed = True
+
+
+class BlockingStreamResponse(FakeResponse):
+    def __init__(self):
+        first_event = b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n'
+        super().__init__(first_event, content_type='text/event-stream')
+        self.read_entered = threading.Event()
+        self.release_read = threading.Event()
+
+    def read1(self, size=-1):
+        if self.offset < len(self.body):
+            return super().read1(size)
+        self.read_entered.set()
+        self.release_read.wait(3)
+        raise OSError('stream socket closed')
 
 
 class FakeConnection:
@@ -62,6 +94,16 @@ class FakeConnection:
         self.close_event.set()
 
 
+class BlockingStreamConnection(FakeConnection):
+    def __init__(self):
+        self.stream_response = BlockingStreamResponse()
+        super().__init__(self.stream_response)
+
+    def close(self):
+        super().close()
+        self.stream_response.release_read.set()
+
+
 def chat_response(content='{"ok": true}', *, extra_message=None):
     message = {'role': 'assistant', 'content': content}
     if extra_message:
@@ -69,6 +111,16 @@ def chat_response(content='{"ok": true}', *, extra_message=None):
     return json.dumps({'id': 'chatcmpl-test', 'choices': [{'index': 0, 'message': message,
                                                             'finish_reason': 'stop'}]},
                       separators=(',', ':'))
+
+
+def server_sent_events(*events):
+    lines = []
+    for event in events:
+        if event == '[DONE]':
+            lines.extend(('data: [DONE]', ''))
+        else:
+            lines.extend(('data: ' + json.dumps(event, separators=(',', ':')), ''))
+    return '\n'.join(lines).encode('utf-8')
 
 
 def make_context():
@@ -304,14 +356,17 @@ class DeepSeekRequestTests(unittest.TestCase):
             ],
         })
         connection = FakeConnection(FakeResponse(catalog))
+        seen = []
         client = DeepSeekApiClient(key_resolver=lambda: API_KEY,
-                                   transport_factory=lambda *args: connection)
+                                   transport_factory=lambda *args: seen.append(args) or connection)
 
         models = client.list_models()
 
         self.assertEqual([model.id for model in models], ['deepseek-flash', 'deepseek-v4-pro'])
         self.assertEqual(models[0].display_name, 'DeepSeek Flash')
         self.assertEqual(models[0].supported_efforts, ('low', 'high', 'max'))
+        self.assertEqual(deepseek_api._REQUEST_TIMEOUT_SECONDS, 45.0)
+        self.assertEqual(seen[0][2], deepseek_api._REQUEST_TIMEOUT_SECONDS)
         method, path, body, headers = connection.request_args
         self.assertEqual((method, path), ('GET', '/models'))
         self.assertIsNone(body)
@@ -352,12 +407,234 @@ class DeepSeekRequestTests(unittest.TestCase):
         payload = json.loads(raw_body.decode('utf-8'))
         self.assertEqual(payload['model'], MODEL)
         self.assertEqual(payload['reasoning_effort'], 'high')
-        self.assertFalse(payload['stream'])
+        self.assertTrue(payload['stream'])
         self.assertNotIn('tools', payload)
         self.assertNotIn('tool_choice', payload)
         self.assertEqual(headers['Authorization'], 'Bearer ' + API_KEY)
         self.assertEqual(headers['Content-Type'], 'application/json')
+        self.assertEqual(headers['Accept'], 'text/event-stream')
         self.assertTrue(connection.closed)
+
+    def test_generation_streams_final_content_but_discards_reasoning_content(self):
+        response_body = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'role': 'assistant',
+                                                   'reasoning_content': 'private reasoning'}}]},
+            {'choices': [{'index': 0, 'delta': {'content': '{"ok": '}}]},
+            {'choices': [{'index': 0, 'delta': {'content': 'true}'},
+                         'finish_reason': 'stop'}]},
+            '[DONE]',
+        )
+        connection = FakeConnection(FakeResponse(
+            response_body, content_type='text/event-stream', read_chunk_size=11,
+        ))
+        client, _ = self.make_client(connection)
+
+        result = client.generate(make_context(), 'prompt')
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertNotIn('private reasoning', result)
+        self.assertTrue(connection.closed)
+
+    def test_cancel_event_interrupts_stream_read_and_discards_partial_content(self):
+        connection = BlockingStreamConnection()
+        client, _ = self.make_client(connection)
+        cancelled = threading.Event()
+        errors = []
+
+        def invoke():
+            try:
+                client.generate(make_context(), 'prompt', cancelled)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=invoke)
+        worker.start()
+        self.assertTrue(connection.stream_response.read_entered.wait(2))
+        cancelled.set()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(connection.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('取消', str(errors[0]))
+        self.assertNotIn('partial', str(errors[0]))
+
+    def test_streaming_rejects_content_truncated_by_output_limit(self):
+        response_body = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'content': '{"partial":'}}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]},
+            '[DONE]',
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            DeepSeekApiClient._extract_stream_content(
+                FakeResponse(response_body, content_type='text/event-stream'))
+
+        self.assertEqual(raised.exception.diagnostic_code, 'output_limit')
+
+    def test_json_response_rejects_content_truncated_by_output_limit(self):
+        response_body = json.dumps({
+            'choices': [{'message': {'role': 'assistant', 'content': '{"partial":'},
+                         'finish_reason': 'length'}],
+        })
+
+        with self.assertRaises(ValueError) as raised:
+            DeepSeekApiClient._extract_content(response_body.encode('utf-8'))
+
+        self.assertEqual(raised.exception.diagnostic_code, 'output_limit')
+
+    def test_generation_retries_once_with_expanded_output_limit_after_length(self):
+        truncated = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'content': '{"partial":'}}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]},
+            '[DONE]',
+        )
+        connections = [
+            FakeConnection(FakeResponse(truncated, content_type='text/event-stream')),
+            FakeConnection(FakeResponse(chat_response('{"ok": true}'))),
+        ]
+        requests = []
+
+        def transport(*args):
+            connection = connections.pop(0)
+            requests.append(connection)
+            return connection
+
+        client = DeepSeekApiClient(
+            key_resolver=lambda: API_KEY,
+            transport_factory=transport,
+            preference_resolver=lambda: DeepSeekModelPreference(
+                MODEL, 'none', deepseek_api.DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS * 2),
+        )
+        client.authorize_chargeable_requests('run_1')
+
+        result = client.generate(make_context(), 'prompt')
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual([
+            json.loads(connection.request_args[2].decode('utf-8'))['max_tokens']
+            for connection in requests
+        ], [deepseek_api.DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS,
+            deepseek_api.DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS * 2])
+
+    def test_generation_retry_stays_within_selected_model_output_ceiling(self):
+        truncated = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'content': '{"partial":'}}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]},
+            '[DONE]',
+        )
+        connections = [
+            FakeConnection(FakeResponse(truncated, content_type='text/event-stream')),
+            FakeConnection(FakeResponse(chat_response('{"ok": true}'))),
+        ]
+        requests = []
+
+        def transport(*args):
+            connection = connections.pop(0)
+            requests.append(connection)
+            return connection
+
+        model_ceiling = 12_288
+        client = DeepSeekApiClient(
+            key_resolver=lambda: API_KEY,
+            transport_factory=transport,
+            preference_resolver=lambda: DeepSeekModelPreference(
+                MODEL, 'none', model_ceiling),
+        )
+        client.authorize_chargeable_requests('run_1')
+
+        self.assertEqual(client.generate(make_context(), 'prompt'), '{"ok": true}')
+        limits = [
+            json.loads(connection.request_args[2].decode('utf-8'))['max_tokens']
+            for connection in requests
+        ]
+        self.assertEqual(limits, [deepseek_api.DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS,
+                                  model_ceiling])
+        self.assertLessEqual(max(limits), model_ceiling)
+
+    def test_generation_does_not_retry_when_model_ceiling_is_initial_limit(self):
+        truncated = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'content': '{"partial":'}}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]},
+            '[DONE]',
+        )
+        connection = FakeConnection(FakeResponse(truncated, content_type='text/event-stream'))
+        transport = unittest.mock.Mock(return_value=connection)
+        model_ceiling = deepseek_api.DEFAULT_DEEPSEEK_MAX_OUTPUT_TOKENS
+        client = DeepSeekApiClient(
+            key_resolver=lambda: API_KEY,
+            transport_factory=transport,
+            preference_resolver=lambda: DeepSeekModelPreference(
+                MODEL, 'max', model_ceiling),
+        )
+        client.authorize_chargeable_requests('run_1')
+
+        with self.assertRaises(ValueError) as raised:
+            client.generate(make_context(), 'prompt')
+
+        self.assertEqual(raised.exception.diagnostic_code, 'output_limit')
+        body = json.loads(connection.request_args[2].decode('utf-8'))
+        self.assertEqual(body['max_tokens'], model_ceiling)
+        transport.assert_called_once()
+
+    def test_generation_does_not_retry_other_provider_finish_reasons(self):
+        response_body = server_sent_events(
+            {'choices': [{'index': 0, 'delta': {'content': 'partial'}}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'content_filter'}]},
+            '[DONE]',
+        )
+        connection = FakeConnection(FakeResponse(
+            response_body, content_type='text/event-stream'))
+        client, _ = self.make_client(connection)
+
+        with self.assertRaises(ValueError) as raised:
+            client.generate(make_context(), 'prompt')
+
+        self.assertEqual(raised.exception.diagnostic_code, 'content_filtered')
+        self.assertTrue(connection.closed)
+
+    def test_api_key_in_serialized_model_field_is_blocked_before_transport(self):
+        connection = FakeConnection()
+        transport = unittest.mock.Mock(return_value=connection)
+        client = DeepSeekApiClient(
+            key_resolver=lambda: API_KEY,
+            transport_factory=transport,
+            preference_resolver=lambda: DeepSeekModelPreference(API_KEY, 'high'),
+        )
+        client.authorize_chargeable_requests('run_1')
+
+        with self.assertRaises(ValueError) as raised:
+            client.generate(make_context(), 'prompt')
+
+        self.assertNotIn(API_KEY, str(raised.exception))
+        self.assertIsNone(connection.request_args)
+        transport.assert_not_called()
+
+    def test_generation_uses_its_dedicated_longer_deadline(self):
+        connection = FakeConnection()
+        client, seen = self.make_client(connection)
+
+        self.assertGreaterEqual(deepseek_api._GENERATION_TIMEOUT_SECONDS, 300)
+        self.assertGreater(deepseek_api._GENERATION_TIMEOUT_SECONDS,
+                           deepseek_api._REQUEST_TIMEOUT_SECONDS)
+        client.generate(make_context(), 'prompt')
+
+        self.assertEqual(seen[0][2], deepseek_api._GENERATION_TIMEOUT_SECONDS)
+
+    def test_default_https_connection_receives_generation_timeout_and_deadline(self):
+        client = DeepSeekApiClient(key_resolver=lambda: API_KEY)
+        deadline = time.monotonic() + deepseek_api._GENERATION_TIMEOUT_SECONDS
+
+        connection = client._new_connection(
+            ssl.create_default_context(), _AbortSignal(), deadline, 'run_1',
+            timeout_seconds=deepseek_api._GENERATION_TIMEOUT_SECONDS,
+        )
+        try:
+            self.assertIsInstance(connection, _CancellableHTTPSConnection)
+            self.assertEqual(connection.timeout, deepseek_api._GENERATION_TIMEOUT_SECONDS)
+            self.assertEqual(connection._deadline, deadline)
+        finally:
+            connection.close()
 
     def test_redirect_is_rejected_without_following_location(self):
         connection = FakeConnection(FakeResponse('', status=302))
@@ -370,13 +647,15 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertTrue(connection.closed)
 
     def test_non_success_status_and_transport_exception_are_sanitized(self):
-        for connection in (FakeConnection(FakeResponse(API_KEY, status=401)),
-                           _ExplodingConnection()):
+        failures = ((FakeConnection(FakeResponse(API_KEY, status=401)), 'http_401'),
+                    (_ExplodingConnection(), 'request_failed'))
+        for connection, expected_code in failures:
             client, _ = self.make_client(connection)
             with self.subTest(connection=type(connection).__name__), self.assertRaises(ValueError) as raised:
                 client.generate(make_context(), 'prompt')
             self.assertNotIn(API_KEY, str(raised.exception))
             self.assertNotIn(API_KEY, repr(client))
+            self.assertEqual(raised.exception.diagnostic_code, expected_code)
 
     def test_duplicate_keys_nonfinite_values_and_invalid_response_shapes_are_rejected(self):
         bodies = [
@@ -735,7 +1014,7 @@ class DeepSeekCancellationTests(unittest.TestCase):
 
         def invoke():
             try:
-                with patch('mathmodel_paper_studio.agents.providers.deepseek_api._REQUEST_TIMEOUT_SECONDS', 0.05):
+                with patch('mathmodel_paper_studio.agents.providers.deepseek_api._GENERATION_TIMEOUT_SECONDS', 0.05):
                     client.generate(make_context(), 'prompt')
             except Exception as exc:
                 result.append(exc)

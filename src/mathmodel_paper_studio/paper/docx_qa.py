@@ -46,9 +46,13 @@ class DocxQaReport:
     omitted_optional_sections: tuple[str, ...] = ()
     quality_warnings: tuple[str, ...] = ()
     target_pages: int | None = None
+    minimum_pages: int | None = None
+    maximum_pages: int | None = None
     actual_pages: int | None = None
     target_page_status: str = 'not_rendered'
     equation_count: int = 0
+    flowchart_count: int = 0
+    content_character_count: int = 0
     caption_numbering_status: str = 'not_checked'
 
     @property
@@ -119,7 +123,8 @@ def run_docx_qa(path: Path, source_inspection: TemplateInspection, mapping: Temp
                 *, required_section_keys=(), required_figure_keys=(), expected_evidence_ids=(),
                 standard: PaperStandard | None = None, standard_sections=(),
                 keyword_count: int | None = None, expected_equation_count: int | None = None,
-                pending_references=()) -> DocxQaReport:
+                expected_flowchart_count: int | None = None,
+                content_character_count: int | None = None, pending_references=()) -> DocxQaReport:
     """Check package structure and evidence markers without claiming rendered-page acceptance."""
     if not isinstance(source_inspection, TemplateInspection) or not isinstance(mapping, TemplateMapping):
         raise TypeError('Source template inspection and mapping are required.')
@@ -136,6 +141,12 @@ def run_docx_qa(path: Path, source_inspection: TemplateInspection, mapping: Temp
     if expected_equation_count is not None and (
             type(expected_equation_count) is not int or not 0 <= expected_equation_count <= 64):
         raise ValueError('Expected equation count is invalid.')
+    if expected_flowchart_count is not None and (
+            type(expected_flowchart_count) is not int or not 0 <= expected_flowchart_count <= 64):
+        raise ValueError('Expected flowchart count is invalid.')
+    if content_character_count is not None and (
+            type(content_character_count) is not int or not 0 <= content_character_count <= 1_000_000):
+        raise ValueError('Paper content character count is invalid.')
     pending_reference_notes = _keys(pending_references, 'Pending reference notes')
     if any(_EVIDENCE_ID.fullmatch(item) is None for item in expected_evidence):
         raise ValueError('Expected evidence IDs contain an invalid identifier.')
@@ -196,6 +207,12 @@ def run_docx_qa(path: Path, source_inspection: TemplateInspection, mapping: Temp
     omitted_optional_sections = tuple(
         key for key in selected_standard.optional_sections if key not in included_standard_sections)
     equation_count = sum(1 for _ in document.iter(_M + 'oMath'))
+    flowchart_count = sum(
+        1 for item in document.iter(_WP + 'docPr')
+        if (item.get('descr') or '').startswith('Visual type: flowchart;')
+    )
+    if content_character_count is None:
+        content_character_count = sum(len(text) for text in paragraph_texts if text)
     warnings = []
     if missing_standard_sections:
         warnings.append('未覆盖规范要求章节：' + '、'.join(missing_standard_sections))
@@ -203,13 +220,41 @@ def run_docx_qa(path: Path, source_inspection: TemplateInspection, mapping: Temp
         warnings.append('可选章节未生成；请按题目判断是否需要：' + '、'.join(omitted_optional_sections))
     if keyword_count == 0:
         warnings.append('论文关键词缺失；可在 Word 中补充。')
-    warnings.append(f'篇幅参考目标约 {selected_standard.target_pages} 页；页面尚未渲染，实际页数未知。')
+    if selected_standard.minimum_pages is not None and selected_standard.maximum_pages is not None:
+        warnings.append(
+            f'篇幅目标 {selected_standard.minimum_pages}–{selected_standard.maximum_pages} 页，'
+            f'中心目标 {selected_standard.target_pages} 页；页面尚未渲染，实际页数未知。'
+        )
+    else:
+        warnings.append(f'篇幅参考目标约 {selected_standard.target_pages} 页；页面尚未渲染，实际页数未知。')
+    if selected_standard.target_body_characters is not None:
+        if content_character_count < selected_standard.target_body_characters:
+            warnings.append(
+                f'当前正文约 {content_character_count:,} 字，低于约 '
+                f'{selected_standard.target_body_characters:,} 字的内容规划目标；请检查是否缺少推导、分析或证据。'
+            )
+        else:
+            warnings.append(f'正文内容量约 {content_character_count:,} 字；最终页数仍需 Word 渲染确认。')
     if pending_reference_notes:
         warnings.extend(pending_reference_notes)
     if not pending_citations and 'references' not in included_standard_sections:
         warnings.append('没有可验证参考文献清单；请按实际来源补充或确认无需引用。')
     if expected_equation_count is not None and equation_count != expected_equation_count:
         warnings.append(f'公式对象数量与清单不一致：清单 {expected_equation_count}，文档 {equation_count}。')
+    if selected_standard.recommended_equation_count is not None and (
+            equation_count < selected_standard.recommended_equation_count):
+        warnings.append(
+            f'当前可编辑公式对象 {equation_count} 个，低于约 '
+            f'{selected_standard.recommended_equation_count} 个的建议值；请按模型需要补充有效推导。'
+        )
+    if expected_flowchart_count is not None and flowchart_count != expected_flowchart_count:
+        warnings.append(f'流程图数量与清单不一致：清单 {expected_flowchart_count}，文档 {flowchart_count}。')
+    if selected_standard.recommended_flowchart_count is not None and (
+            flowchart_count < selected_standard.recommended_flowchart_count):
+        warnings.append(
+            f'当前结构化流程图 {flowchart_count} 张，低于 '
+            f'{selected_standard.recommended_flowchart_count} 张的建议值；只补充与题目相关的流程图。'
+        )
     equation_labels = []
     table_labels = []
     figure_labels = []
@@ -240,8 +285,12 @@ def run_docx_qa(path: Path, source_inspection: TemplateInspection, mapping: Temp
         omitted_optional_sections=omitted_optional_sections,
         quality_warnings=tuple(dict.fromkeys(warnings)),
         target_pages=selected_standard.target_pages,
+        minimum_pages=selected_standard.minimum_pages,
+        maximum_pages=selected_standard.maximum_pages,
         actual_pages=None,
         target_page_status='not_rendered',
         equation_count=equation_count,
+        flowchart_count=flowchart_count,
+        content_character_count=content_character_count,
         caption_numbering_status=caption_numbering_status,
     )

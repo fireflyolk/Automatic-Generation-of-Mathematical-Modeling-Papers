@@ -301,6 +301,25 @@ class MainWindowDeepSeekConsentTests(unittest.TestCase):
         self.assertIs(resumed.status, RunStatus.COMPLETED)
         self.assertEqual(['run_1'], client.revoked)
 
+    def test_missing_model_catalog_does_not_authorize_application_maximum(self):
+        from unittest.mock import PropertyMock
+
+        window, _client, _workflow, _run, _errors = self.make_window()
+        window.thread_pool = DeferredThreadPool()
+        window._selected_sources = lambda: ((ROOT / 'data.csv',), ('source_1',))
+        status = DeepSeekApiClient(key_resolver=lambda: 'test-only').probe()
+        with patch.object(type(window.settings_view), 'selected_status',
+                          new_callable=PropertyMock, return_value=status), \
+                patch('mathmodel_paper_studio.ui.main_window.FunctionWorker') as worker_type, \
+                patch.object(window, '_prepare_run_review') as prepare:
+            window._review_run()
+            review_operation = worker_type.call_args.args[0]
+            review_operation(None, lambda _message: None)
+
+        preference = prepare.call_args.args[-1]
+        self.assertEqual(preference.max_output_tokens, 8192)
+        self.assertEqual(preference.effort, 'high')
+
     def test_reviewed_model_preference_is_bound_to_the_authorized_run(self):
         window, client, _workflow, run, _errors = self.make_window()
         preference = DeepSeekModelPreference('deepseek-v4-pro', 'max')
