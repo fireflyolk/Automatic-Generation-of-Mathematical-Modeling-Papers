@@ -11,7 +11,7 @@ import uuid
 from mathmodel_paper_studio.bootstrap.paths import APPROVED_BASE, AppPaths
 from mathmodel_paper_studio.domain.models import ScopeManifest, Stage
 from mathmodel_paper_studio.agents.preflight import Provider, ProviderStatus, AdapterCapabilities
-from mathmodel_paper_studio.agents.protocol import AgentRequest, AgentEvent
+from mathmodel_paper_studio.agents.protocol import AgentRequest, AgentEvent, EventKind
 from mathmodel_paper_studio.agents.process_runner import ProcessRunner, ProcessLimits, native_cli_environment, generated_environment
 from mathmodel_paper_studio.agents.windows_job import NativeJobProcess, process_alive
 from mathmodel_paper_studio.security.scope_manifest import build_scope
@@ -231,6 +231,63 @@ class ProcessRunnerTests(unittest.TestCase):
         text = ''.join(event.text for event in self.redacted_events(('known-', 'secret ', 'safe ending'), literals=('known-secret',)))
         self.assertNotIn('known-secret', text)
         self.assertIn('safe ending', text)
+
+    def test_known_secret_prefix_at_text_end_is_released_when_it_does_not_match(self):
+        from mathmodel_paper_studio.agents.process_runner import _Redactor
+        redactor = _Redactor('', ('test-secret',))
+
+        visible = redactor.clean('prompt') + redactor.clean('', final=True)
+
+        self.assertEqual('prompt', visible)
+
+
+    def test_long_known_literal_prefix_is_bounded_by_literal_size_and_redacted(self):
+        from mathmodel_paper_studio.agents.process_runner import _Redactor
+        literal = 'A' * 300 + 'Z'
+        first = literal[:257]
+        rest = literal[257:]
+
+        for redactor in (_Redactor(literal, ()), _Redactor('', (literal,))):
+            with self.subTest(prompt=literal in redactor.hidden):
+                self.assertEqual('', redactor.clean(first))
+                self.assertLessEqual(max(map(len, redactor.candidates.values()), default=0),
+                                     redactor.literal_candidate_bound)
+                self.assertEqual('[已隐藏]', redactor.clean(rest, final=True))
+
+
+    def test_long_candidate_release_is_split_to_event_limit(self):
+        mismatch_literal = 'A' * 65535 + 'Z'
+        mismatch_events = self.redacted_events((mismatch_literal[:-1], '12'), literals=(mismatch_literal,))
+        mismatch_text = ''.join(event.text for event in mismatch_events)
+        self.assertEqual(mismatch_literal[:-1] + '12', mismatch_text)
+        self.assertTrue(all(len(event.text.encode('utf-8')) <= 65536 for event in mismatch_events))
+
+        terminal_literal = '中' * 30000 + 'Z'
+        terminal_events = self.redacted_events(('中' * 20000, '中' * 10000), literals=(terminal_literal,))
+        terminal_text = ''.join(event.text for event in terminal_events)
+        self.assertEqual(terminal_literal[:-1], terminal_text)
+        self.assertTrue(all(len(event.text.encode('utf-8')) <= 65536 for event in terminal_events))
+
+
+    def test_long_text_flush_does_not_duplicate_nontext_status_events(self):
+        from mathmodel_paper_studio.agents.process_runner import ProcessRunner, _Redactor
+        literal = 'A' * 65535 + 'Z'
+        runner = ProcessRunner(self.gate, self.paths)
+        redactor = _Redactor('', (literal,))
+        state = {'terminal': None, 'events': 0}
+        first = runner._parse_events(
+            self.request, literal[:-1], lambda _: (AgentEvent('r1', 'text', literal[:-1]),), state, redactor,
+        )
+        events = list(first)
+        released = runner._parse_events(
+            self.request, '12',
+            lambda _: (AgentEvent('r1', EventKind.TOOL_STARTED, '12', 'item1'),), state, redactor,
+        )
+        events.extend(released)
+
+        self.assertEqual(1, sum(event.kind is EventKind.TOOL_STARTED for event in events))
+        self.assertEqual(literal[:-1] + '12', ''.join(event.text for event in events))
+        self.assertTrue(all(len(event.text.encode('utf-8')) <= 65536 for event in events))
 
 
     def test_whitespace_separated_token_password_markers_are_redacted_across_events(self):

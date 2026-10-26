@@ -158,10 +158,11 @@ class MvpWorkflowE2ETests(unittest.TestCase):
         paper = next(item for item in state.artifacts if item.kind == "paper")
         with ZipFile(self.project_root / paper.relative_path) as archive:
             xml = archive.read("word/document.xml").decode("utf-8")
+            review = archive.read("customXml/mmps-paper-review.xml").decode("utf-8")
         self.assertIn("The fixed fixture mean is 3.", xml)
         self.assertTrue(engine.paper_evidence)
         for evidence_id in engine.paper_evidence:
-            self.assertIn(evidence_id, xml)
+            self.assertIn(evidence_id, review)
         qa = next(item for item in state.artifacts if item.stage is Stage.DOCX_QA)
         self.assertEqual("not_performed", json.loads(
             (self.project_root / qa.relative_path).read_text("utf-8"))["visual_rendering"])
@@ -203,7 +204,7 @@ class ReleaseAuditContracts(unittest.TestCase):
     def test_build_preflight_requires_the_locked_computation_runtime(self):
         script = ROOT / "scripts/build_windows.ps1"
         runtime = Path(
-            r"F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261018"
+            r"F:\MathModelPaperStudio\downloads\mathmodel-paper-studio-sandbox-20261018"
             r"\computation-runtime-final"
         )
         good = subprocess.run(

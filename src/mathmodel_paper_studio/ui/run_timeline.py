@@ -189,13 +189,15 @@ class RunTimelineWidget(QWidget):
                 ProgressKind.RUN_STARTED, ProgressKind.RUN_PAUSED,
                 ProgressKind.RUN_CANCELLED, ProgressKind.RUN_FAILED,
                 ProgressKind.RUN_COMPLETED, ProgressKind.STAGE_STARTED,
-                ProgressKind.STAGE_PROGRESS, ProgressKind.STAGE_COMPLETED,
+                ProgressKind.STAGE_PROGRESS, ProgressKind.PAPER_PREVIEW_UPDATED,
+                ProgressKind.STAGE_COMPLETED,
                 ProgressKind.STAGE_PAUSED, ProgressKind.STAGE_FAILED,
                 ProgressKind.STAGE_CANCELLED,
             }
         if selected == 'agent':
             return event.kind in {
                 ProgressKind.AGENT_REQUEST_STARTED, ProgressKind.AGENT_WAITING,
+                ProgressKind.AGENT_RETRYING,
                 ProgressKind.AGENT_MESSAGE, ProgressKind.AGENT_COMPLETED,
                 ProgressKind.AGENT_CANCELLED, ProgressKind.AGENT_FAILED,
                 ProgressKind.AGENT_BLOCKED,

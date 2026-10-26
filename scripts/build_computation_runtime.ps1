@@ -1,15 +1,15 @@
 [CmdletBinding()]
 param(
-    [string]$RuntimeRoot = 'F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261018\computation-runtime-final',
-    [string]$DownloadsRoot = 'F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261018',
+    [string]$RuntimeRoot = 'F:\MathModelPaperStudio\downloads\mathmodel-paper-studio-sandbox-20261018\computation-runtime-final',
+    [string]$DownloadsRoot = 'F:\MathModelPaperStudio\downloads\mathmodel-paper-studio-sandbox-20261018',
     [string]$WheelhouseRoot,
-    [string]$TaskTemp = 'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-sandbox-20261018',
-    [string]$PythonSourceRoot = 'F:\Codex另一个工作的地方\python\cpython-3.13.14-windows-x86_64-none',
-    [string]$BuildPython = 'F:\Codex另一个工作的地方\worktrees\mathmodel-paper-studio-impl-20261015\.venv\Scripts\python.exe'
+    [string]$TaskTemp = 'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-sandbox-20261018',
+    [string]$PythonSourceRoot = 'F:\MathModelPaperStudio\python\cpython-3.13.14-windows-x86_64-none',
+    [string]$BuildPython = 'F:\MathModelPaperStudio\worktrees\mathmodel-paper-studio-impl-20261015\.venv\Scripts\python.exe'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$approvedRoot = 'F:\Codex另一个工作的地方'
+$approvedRoot = 'F:\MathModelPaperStudio'
 $lockPath = Join-Path $projectRoot 'requirements-execution.lock'
 $wheelhouse = if ($WheelhouseRoot) { $WheelhouseRoot } else { Join-Path $DownloadsRoot 'wheels' }
 $sitePackages = Join-Path $RuntimeRoot 'Lib\site-packages'

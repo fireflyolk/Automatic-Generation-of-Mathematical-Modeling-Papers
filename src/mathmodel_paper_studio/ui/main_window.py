@@ -1313,6 +1313,9 @@ class MainWindow(FluentWindow):
                     expected_equation_count=manifest.get('equation_count'),
                     expected_flowchart_count=manifest.get('flowchart_count'),
                     content_character_count=manifest.get('content_character_count'),
+                    table_character_count=manifest.get('table_character_count'),
+                    problem_coverage=manifest.get('problem_coverage', ()),
+                    problem_coverage_evidence=manifest.get('problem_coverage_evidence', ()),
                     pending_references=manifest.get('pending_references', ()),
                 )
             except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
@@ -1387,7 +1390,15 @@ class MainWindow(FluentWindow):
                 lines.append(f'篇幅目标：{page_target}；实际页数：'
                              f'{report.actual_pages if report.actual_pages is not None else "未渲染，未知"}')
                 lines.append(f'公式对象数：{report.equation_count}；编号检查：{report.caption_numbering_status}')
-                lines.append(f'结构化流程图数：{report.flowchart_count}；正文字符数：{report.content_character_count:,}')
+                body_floor = (f'（最低 {report.minimum_body_characters:,}）'
+                              if report.minimum_body_characters is not None else '')
+                lines.append(f'结构化流程图数：{report.flowchart_count}；正文字符数：'
+                             f'{report.content_character_count:,}{body_floor}')
+                lines.append(f'表格字符数：{report.table_character_count:,}；逐题论证闭环：{report.problem_coverage_status}')
+                if report.missing_problem_coverage:
+                    lines.append('缺少逐题论证内容：' + '、'.join(report.missing_problem_coverage))
+                if report.workflow_notes:
+                    lines.append('正文包含内部工作流提示：' + '、'.join(report.workflow_notes))
         lines.extend(f'\u590d\u6838\u9879\uff1a{item}' for item in review_items)
         lines.append('\u6570\u5b66\u7ed3\u8bba\u548c\u6570\u503c\u5c1a\u672a\u72ec\u7acb\u9a8c\u8bc1\uff0c\u8bf7\u4eba\u5de5\u590d\u6838\u3002')
         lines.append('Word \u9875\u9762\u6e32\u67d3\uff1a\u672a\u6267\u884c\u3002')

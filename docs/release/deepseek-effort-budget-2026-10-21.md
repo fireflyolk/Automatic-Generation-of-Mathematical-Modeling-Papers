@@ -2,7 +2,7 @@
 
 ## Confirmed cause
 
-Run `105d87b9b49e4785be36705de6ac0194` paused at `model_proposal`
+Run `[运行/项目 ID 已省略]` paused at `model_proposal`
 with `output_limit`. The saved schema 2 preference selected `deepseek-flash`,
 effort `max`, and a stale catalog ceiling of 16,384 tokens. The previous
 adapter requested 8,192 tokens and retried once at 16,384, so both requests
@@ -56,15 +56,15 @@ and [Models API](https://api-docs.deepseek.com/api/list-models/).
 
 Package:
 
-Release executable: [local path omitted].
+`[本机路径已省略]`
 
 Acceptance reports and preference backup:
 
-Acceptance reports and preference backup: [local paths omitted].
+`[本机路径已省略]`
 
 Test/build logs:
 
-Test/build logs: [local paths omitted].
+`[本机路径已省略]`
 
 Real paid generation and the user's complete nine-stage workflow were not run
 as part of this acceptance. Open the original project in the new app, start a

@@ -5,7 +5,7 @@ import unittest
 from scripts.verify_f_drive_outputs import inventory_tree, read_lock
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-sandbox-20261018')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-sandbox-20261018')
 
 
 class RequirementLockParserTests(unittest.TestCase):

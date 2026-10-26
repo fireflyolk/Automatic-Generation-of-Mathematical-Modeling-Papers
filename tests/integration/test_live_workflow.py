@@ -2,13 +2,14 @@
 from dataclasses import replace
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 import struct
 import tempfile
 import zlib
 import threading
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from mathmodel_paper_studio.agents.preflight import AdapterCapabilities, Provider, ProviderStatus
@@ -18,6 +19,7 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.domain.models import Run, RunStatus, SourceFile, Stage, StageStatus
 from mathmodel_paper_studio.execution.python_runner import PythonRunner, RunArtifactLayout, _atomic_create, _evidence
 from mathmodel_paper_studio.execution.failure_summary import ExecutionFailureSummary
+from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.projects.project_service import ProjectService
@@ -28,9 +30,10 @@ from mathmodel_paper_studio.workflow.live_engine import LiveWorkflowEngine
 from mathmodel_paper_studio.workflow.progress import ProgressKind, RunProgressReporter
 from mathmodel_paper_studio.workflow.context_builder import ContextBuilder
 from mathmodel_paper_studio.workflow.stages import PauseReason, StageOutput, StageResult, WORKFLOW_STAGES
-from tests.fixtures.docx.fixture_factory import write_fixture
+from tests.fixtures.docx.fixture_factory import write_fixture, write_standard_fixture
+from tests.unit.workflow.test_paper_optional_evidence import batch_flowchart
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\live-workflow')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-run-sidebar\live-workflow')
 
 
 
@@ -40,11 +43,84 @@ def valid_png():
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
             + chunk(b'IDAT', zlib.compress(b'\x00\x00\x00\x00')) + chunk(b'IEND', b''))
 
+_FILLER = ('结合所选观测数据的结构与量纲，本段继续展开建模细节、变量关系与推导步骤的说明，'
+           '交代参数含义、适用条件与计算口径，并说明该部分论述与题面要求的对应关系，'
+           '保证论证完整、连贯、可复现，且不引入外部未证实的结论。')
+
+
+def _padded(seed: str, target: int) -> str:
+    text = seed
+    while len(text) < target:
+        text += _FILLER
+    return text[:target].rstrip('，；、') + '。'
+
+
 class FakeProvider:
     def __init__(self, responses=None, cancel_stage=None):
         self.responses = responses or {}
         self.cancel_stage = cancel_stage
         self.calls = []
+        self.declared_outputs = None
+
+    @staticmethod
+    def _prompt_payload(prompt):
+        return json.loads(prompt.split('<UNTRUSTED_STAGE_DATA>\n', 1)[1]
+                          .rsplit('\n</UNTRUSTED_STAGE_DATA>', 1)[0])
+
+    @classmethod
+    def _code_outputs(cls, prompt):
+        payload = cls._prompt_payload(prompt)
+        planned = [item['output_name'] for item in payload.get('figure_plan', ())
+                   if isinstance(item, dict) and isinstance(item.get('output_name'), str)]
+        outputs = [{'name': 'metrics.csv', 'kind': 'table', 'columns': ['指标', '数值'], 'rows': 1},
+                   {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]
+        outputs += [{'name': name, 'kind': 'figure', 'columns': [], 'rows': None}
+                    for name in planned if name not in {'plot.png'}]
+        return outputs
+
+    def _paper_response(self, prompt):
+        payload = self._prompt_payload(prompt)
+        batch = payload['paper_batch']
+        schema = json.loads(prompt.split('JSON schema example: ', 1)[1].splitlines()[0])
+        coverage = batch.get('problem_coverage')
+        validated = payload.get('validated_evidence', ())
+        figure_ids = [item['evidence_id'] for item in validated if item['kind'] == 'figure']
+        sections = []
+        for key in batch['requested_section_keys']:
+            subsections = [{'title': '模型的适用条件',
+                            'paragraphs': [_padded('本小节说明边界条件与模型推导的适用范围。', 320)]}]
+            if coverage is not None and coverage['section_key'] == key:
+                evidence_ids = ({'evidence_ids': [figure_ids[0]]}
+                                if coverage['require_evidence'] or figure_ids else {})
+                subsections.append({
+                    'title': f"{coverage['problems'][0]['heading']}：观测拟合说明",
+                    'paragraphs': [
+                        _padded('本小节围绕该问题说明建模目标与已知条件、参数估计方法、拟合步骤与误差来源。', 300),
+                        _padded('本段说明该问题的检验方式、敏感性考虑、结果解释的适用范围与对题目的直接回答。', 280)],
+                    **evidence_ids,
+                })
+            sections.append({'section_key': key,
+                             'paragraphs': [_padded('本段解释模型的基本设定、变量定义和适用范围。', 600)],
+                             'subsections': subsections})
+        value = {field: [] for field in schema}
+        value['sections'] = sections
+        if 'title' in schema:
+            value['title'] = '观测拟合模型论文'
+            value['keywords'] = ['观测', '拟合']
+        if batch.get('flowchart_count'):
+            value['flowcharts'] = [batch_flowchart(batch['flowchart_section_key'])]
+        if batch.get('batch_id') == 'results':
+            anchors = {item['kind']: item['section_key']
+                       for item in batch.get('result_artifact_anchors', ())}
+            tables = anchors.get('table') or (batch.get('allowed_table_keys') or ['results_table_1'])[0]
+            figures_anchor = anchors.get('figure') or (batch.get('allowed_figure_keys') or ['results_figure_1'])[0]
+            value['tables'] = [{'section_key': tables, 'evidence_id': item['evidence_id'],
+                                'caption': '样本结果表'}
+                               for item in validated if item['kind'] == 'table']
+            value['figures'] = [{'section_key': figures_anchor, 'evidence_id': item['evidence_id'],
+                                 'caption': '样本结果图'}
+                                for item in validated if item['kind'] == 'figure']
+        return value
 
     def generate(self, context, prompt, cancel_event=None):
         self.calls.append((context.stage, prompt, cancel_event))
@@ -59,19 +135,15 @@ class FakeProvider:
             value = {'assumptions': ['观测独立。'], 'variables': ['x, y'],
                      'equations': ['y = 2x'], 'validation_criteria': ['计算有限残差。']}
         elif context.stage is Stage.CODE_GENERATION:
+            # Repair prompts embed the generated source but not the declared
+            # output plan; replay the declaration captured on the first call.
+            if getattr(context, 'attempt', 0) == 0 or self.declared_outputs is None:
+                self.declared_outputs = self._code_outputs(prompt)
             value = {'source': '# generated only; test runner never executes this\n',
-                     'outputs': [{'name': 'metrics.csv', 'kind': 'table', 'columns': ['指标', '数值'], 'rows': 1},
-                                 {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]}
+                     'outputs': self.declared_outputs}
         else:
             # Prompt embeds an application-owned JSON payload between fixed delimiters.
-            payload = json.loads(prompt.split('<UNTRUSTED_STAGE_DATA>\n', 1)[1].rsplit('\n</UNTRUSTED_STAGE_DATA>', 1)[0])
-            evidence = payload['validated_evidence']
-            table = next(item['evidence_id'] for item in evidence if item['kind'] == 'table')
-            figure = next(item['evidence_id'] for item in evidence if item['kind'] == 'figure')
-            value = {'sections': [{'section_key': 'abstract', 'paragraphs': ['基于本次有限结果生成待复核摘要。'],
-                                    'evidence_ids': [table]}],
-                     'tables': [{'section_key': 'results_table', 'evidence_id': table}],
-                     'figures': [{'section_key': 'results_figure', 'evidence_id': figure, 'caption': '样本结果图'}]}
+            value = self._paper_response(prompt)
         return json.dumps(value, ensure_ascii=False)
 
 
@@ -101,15 +173,23 @@ class FakeComputation:
         _atomic_create(summary, b'{"execution_started":true}')
         artifacts = []
         if self.status is StageStatus.COMPLETED:
-            for name, kind, content in (
-                ('metrics.csv', 'table', b'\xe6\x8c\x87\xe6\xa0\x87,\xe6\x95\xb0\xe5\x80\xbc\nerror,' + (b'NaN' if self.corrupt else b'0') + b'\n'),
-                ('plot.png', 'figure', valid_png()),
-            ):
-                category = '40_results' if kind == 'table' else '50_figures'
+            specs = expected_outputs or (
+                ArtifactExpectation('40_results/calc-0001/metrics.csv', 'table', ('指标', '数值'), 1),
+                ArtifactExpectation('50_figures/calc-0001/plot.png', 'figure', None, None))
+            for spec in specs:
+                name = PurePosixPath(spec.relative_path).name
+                if spec.kind == 'table':
+                    columns = tuple(spec.expected_columns or ('指标', '数值'))
+                    value = 'NaN' if (self.corrupt and name == 'metrics.csv') else '0'
+                    content = (','.join(columns) + '\n'
+                               + ','.join(value for _ in columns) + '\n').encode('utf-8')
+                else:
+                    content = valid_png()
+                category = '40_results' if spec.kind == 'table' else '50_figures'
                 relative = f'{category}/calc-{version:04d}/{name}'
                 path = layout.path_for(relative)
                 _atomic_create(path, content)
-                artifacts.append(_evidence(layout, relative, kind, path))
+                artifacts.append(_evidence(layout, relative, spec.kind, path))
         return SimpleNamespace(stage_status=self.status, execution_started=self.status is StageStatus.COMPLETED,
                                blocked_reason=getattr(
                                    self, 'blocked_reason',
@@ -255,21 +335,31 @@ class RepairingProvider(FakeProvider):
     def __init__(self, *, alter_outputs=False):
         super().__init__()
         self.alter_outputs = alter_outputs
+        self.declared_outputs = None
 
     def generate(self, context, prompt, cancel_event=None):
-        if context.stage is Stage.CODE_GENERATION and context.attempt == 1:
-            self.calls.append((context.stage, prompt, cancel_event))
-            outputs = [{'name': 'metrics.csv', 'kind': 'table', 'columns': ['指标', '数值'], 'rows': 1},
-                       {'name': 'plot.png', 'kind': 'figure', 'columns': [], 'rows': None}]
-            if self.alter_outputs:
-                outputs[0]['name'] = 'unexpected.csv'
-            return json.dumps({'source': 'print("repaired")\n', 'outputs': outputs}, ensure_ascii=False)
+        if context.stage is Stage.CODE_GENERATION:
+            if context.attempt == 0:
+                self.declared_outputs = self._code_outputs(prompt)
+            else:
+                # Repair requests embed the generated source, not the declared
+                # output plan; replay the original declaration instead.
+                self.calls.append((context.stage, prompt, cancel_event))
+                outputs = [dict(item) for item in
+                           (self.declared_outputs or self._code_outputs(prompt))]
+                if self.alter_outputs:
+                    outputs[0]['name'] = 'unexpected.csv'
+                return json.dumps({'source': 'print("repaired")\n', 'outputs': outputs}, ensure_ascii=False)
         return super().generate(context, prompt, cancel_event=cancel_event)
 
 
 class LiveWorkflowTests(unittest.TestCase):
     def setUp(self):
         ROOT.mkdir(parents=True, exist_ok=True)
+        render_patcher = patch('mathmodel_paper_studio.workflow.live_engine.render_flowchart_png',
+                               return_value=valid_png())
+        render_patcher.start()
+        self.addCleanup(render_patcher.stop)
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -280,7 +370,7 @@ class LiveWorkflowTests(unittest.TestCase):
         self.projects, self.runs = ProjectRepository(database), RunRepository(database)
         self.csv = self.root / 'data.csv'
         self.csv.write_text('x,y\n1,2\n2,4\n', encoding='utf-8')
-        self.template = write_fixture(self.root / 'template.docx')
+        self.template = write_standard_fixture(self.root / 'template.docx')
         self.originals = {path: path.read_bytes() for path in (self.csv, self.template)}
         self.project = ProjectService(self.paths, self.projects).create(
             'live fixture', '拟合观测并报告有限误差。', [self.csv], template=self.template)
@@ -294,7 +384,12 @@ class LiveWorkflowTests(unittest.TestCase):
         headings = {item.label: item.anchor_id for item in inspection.anchors if item.kind == 'heading'}
         table = next(item.anchor_id for item in inspection.anchors if item.kind == 'table')
         self.mapping = TemplateMapping.from_selection(inspection, {
-            'abstract': headings['摘要'], 'results_figure': headings['结果'], 'results_table': table})
+            'abstract': headings['摘要'], 'problem_restatement': headings['问题重述'],
+            'problem_analysis': headings['问题分析'], 'assumptions': headings['模型假设'],
+            'notation': headings['符号说明'], 'model': headings['模型建立'],
+            'solution': headings['模型求解'], 'results': headings['结果'],
+            'results_figure': headings['结果图'], 'verification': headings['结果检验'],
+            'conclusion': headings['结论'], 'results_table': table})
         self.status = ProviderStatus(Provider.CLAUDE, 'trusted-cli', 'test', True, None, 'trusted test probe',
                                      AdapterCapabilities(True, True, True, 'provider_transport_only',
                                                          'cli_native_only', 'restricted_read_write'), True)
@@ -315,7 +410,7 @@ class LiveWorkflowTests(unittest.TestCase):
         self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
         self.assertEqual(list(WORKFLOW_STAGES), [item.stage for item in state.stage_records])
         self.assertEqual([Stage.PROBLEM_DECOMPOSITION, Stage.MODEL_PROPOSAL, Stage.CODE_GENERATION,
-                          Stage.PAPER_DRAFTING], [call[0] for call in self.provider.calls])
+                          *([Stage.PAPER_DRAFTING] * 8)], [call[0] for call in self.provider.calls])
         self.assertEqual(1, len(self.runner.calls))
         self.assertEqual(42, self.runner.calls[0][2])
         self.assertTrue(all(path.drive.lower() == 'f:' and path.is_file() for path in self.runner.calls[0][1]))
@@ -325,8 +420,9 @@ class LiveWorkflowTests(unittest.TestCase):
         paper_path = self.project_root / paper.relative_path
         with ZipFile(paper_path) as archive:
             document = archive.read('word/document.xml').decode('utf-8')
-            self.assertIn('基于本次有限结果', document)
-            self.assertIn('待人工核验', document)
+            self.assertIn('观测拟合模型论文', document)
+            self.assertNotIn('待人工核验', document)
+            self.assertIn('customXml/mmps-paper-review.xml', archive.namelist())
             self.assertIn('word/media/mmps-figure-0001.png', archive.namelist())
         qa = next(item for item in state.artifacts if item.stage is Stage.DOCX_QA)
         report = json.loads((self.project_root / qa.relative_path).read_text(encoding='utf-8'))
@@ -493,7 +589,7 @@ class LiveWorkflowTests(unittest.TestCase):
                          (result.diagnostics, [(record.stage, record.status)
                                                for record in result.stage_records]))
         self.assertEqual([item[0] for item in provider.calls], [item[0] for item in provider.scopes])
-        self.assertEqual(4, len(provider.scopes))
+        self.assertEqual(11, len(provider.scopes))
         self.assertTrue(all(scope[1] for scope in provider.scopes))
         self.assertEqual(run.run_id, provider.asserted_run_id)
         preflight = next(item for item in result.artifacts if item.stage is Stage.PREFLIGHT)
@@ -662,8 +758,13 @@ class LiveWorkflowTests(unittest.TestCase):
             def generate(self, context, prompt, cancel_event=None):
                 raw = super().generate(context, prompt, cancel_event=cancel_event)
                 if context.stage is Stage.PAPER_DRAFTING:
-                    calls = [call for call in self.calls if call[0] is Stage.PAPER_DRAFTING]
-                    if len(calls) == 1:
+                    payload = self._prompt_payload(prompt)
+                    batch = payload['paper_batch']
+                    results_seen = sum(
+                        1 for call in self.calls
+                        if call[0] is Stage.PAPER_DRAFTING
+                        and self._prompt_payload(call[1])['paper_batch']['batch_id'] == 'results')
+                    if batch['batch_id'] == 'results' and results_seen == 1:
                         value = json.loads(raw)
                         value['sections'][0]['paragraphs'] = ['private-draft-response-marker']
                         value['figures'][0]['section_key'] = value['sections'][0]['section_key']
@@ -675,9 +776,10 @@ class LiveWorkflowTests(unittest.TestCase):
 
         self.assertEqual(RunStatus.COMPLETED, state.status, state.diagnostics)
         prompts = [prompt for stage, prompt, _ in provider.calls if stage is Stage.PAPER_DRAFTING]
-        self.assertEqual(2, len(prompts))
-        self.assertIn('paper_contract', prompts[1])
-        self.assertNotIn('private-draft-response-marker', prompts[1])
+        self.assertEqual(9, len(prompts))
+        correction = prompts[7]
+        self.assertIn('paper_contract', correction)
+        self.assertNotIn('private-draft-response-marker', correction)
 
     def test_explanatory_paper_text_may_have_an_empty_evidence_list(self):
         class PaperProvider(FakeProvider):
@@ -750,8 +852,8 @@ class LiveWorkflowTests(unittest.TestCase):
                             if stage is Stage.CODE_GENERATION]
         self.assertEqual(2, len(generation_calls))
         self.assertIn('上一次响应未通过 JSON 语法或结构验证', generation_calls[1])
-        self.assertTrue(any(event.kind is ProgressKind.STAGE_PROGRESS
-                            and '格式纠正重试' in event.title for event in events))
+        self.assertTrue(any(event.kind is ProgressKind.AGENT_RETRYING
+                            and '一次针对性纠正重试' in event.title for event in events))
         self.assertEqual(1, len(self.runner.calls))
 
     def test_invalid_json_after_format_repair_pauses_without_execution(self):
@@ -761,7 +863,7 @@ class LiveWorkflowTests(unittest.TestCase):
 
         self.assertEqual(RunStatus.PAUSED, state.status)
         self.assertEqual(Stage.CODE_GENERATION, state.next_stage)
-        self.assertIn('格式纠正重试仍失败', ''.join(state.diagnostics))
+        self.assertIn('一次针对性纠正重试仍失败', ''.join(state.diagnostics))
         self.assertEqual(2, sum(stage is Stage.CODE_GENERATION
                                 for stage, _, _ in provider.calls))
         self.assertFalse(self.runner.calls)
@@ -797,8 +899,8 @@ class LiveWorkflowTests(unittest.TestCase):
         paper_path = self.project_root / paper.relative_path
         with ZipFile(paper_path) as archive:
             document = archive.read('word/document.xml').decode('utf-8')
-        self.assertIn('基于本次有限结果', document)
-        self.assertIn('results table', document)
+        self.assertIn('观测拟合模型论文', document)
+        self.assertIn('样本结果表', document)
 
     def test_paper_drafting_removes_xml_forbidden_controls_from_model_text(self):
         class XmlControlCharacterProvider(FakeProvider):
@@ -999,7 +1101,7 @@ class LiveWorkflowTests(unittest.TestCase):
         ])
         self.assertTrue(any(event.kind is ProgressKind.AGENT_WAITING for event in events))
         messages = [event for event in events if event.kind is ProgressKind.AGENT_MESSAGE]
-        self.assertEqual(4, len(messages))
+        self.assertEqual(11, len(messages))
         self.assertTrue(all(event.item_id == 'item-visible-1' for event in messages))
         self.assertTrue(any(event.kind is ProgressKind.VALIDATION_PASSED
                             and event.stage is Stage.RESULT_VALIDATION for event in events))

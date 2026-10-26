@@ -1,4 +1,5 @@
 import hashlib
+import json
 import tempfile
 import time
 import unittest
@@ -9,6 +10,7 @@ from threading import Event
 from PySide6.QtCore import QThreadPool, Qt
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QSignalSpy, QTest
+from qfluentwidgets import ComboBox
 
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.projects.project_service import ProjectService
@@ -18,7 +20,7 @@ from mathmodel_paper_studio.ui.project_wizard import ProjectWizard
 from tests.fixtures.docx.fixture_factory import write_fixture
 from tests.fixtures.pdf.fixture_factory import pdf_bytes
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\project-wizard')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-fluent-20261017\project-wizard')
 APP = None
 
 
@@ -131,6 +133,81 @@ class ProjectWizardIntegrationTests(unittest.TestCase):
         self.assertIsNone(wizard.template_path)
         self.assertIn('DOCX', wizard.add_source_button.text().upper())
         self.assertNotIn('范围无效', wizard.error_label.text())
+
+    def _make_multisheet_xlsx(self, name='multi.xlsx'):
+        from openpyxl import Workbook
+        path = Path(self.temp.name) / name
+        book = Workbook()
+        book.active.title = '计划购电量'
+        book.active.append(('x', 'y'))
+        book.active.append((1, 2))
+        book.create_sheet('充电电量').append(('a', 'b'))
+        book.save(path)
+        book.close()
+        return path
+
+    @staticmethod
+    def _combo(wizard):
+        for index in range(wizard.file_list.count()):
+            widget = wizard.file_list.itemWidget(wizard.file_list.item(index))
+            if widget is not None:
+                combo = widget.findChild(ComboBox)
+                if combo is not None:
+                    return combo
+        return None
+
+    def test_multisheet_xlsx_offers_sheet_choice_and_imports_selected_sheet(self):
+        multi = self._make_multisheet_xlsx()
+        original_hash = sha256(multi)
+        wizard = self._make_wizard()
+        wizard.title_input.setText('多表工作簿')
+        wizard.problem_input.setPlainText('分析两个工作表中选定的数据。')
+
+        wizard.set_source_files((multi,))
+
+        self.assertEqual({'multi.xlsx': '计划购电量'}, wizard.sheet_selection)
+        combo = self._combo(wizard)
+        self.assertIsNotNone(combo, '多工作表 XLSX 必须提供工作表下拉框')
+        self.assertEqual('计划购电量', combo.currentText())
+
+        combo.setCurrentIndex(1)
+        self.assertEqual({'multi.xlsx': '充电电量'}, wizard.sheet_selection)
+
+        created = QSignalSpy(wizard.project_created)
+        failures = QSignalSpy(wizard.operation_failed)
+        wizard.show()
+        QTest.mouseClick(wizard.create_button, Qt.MouseButton.LeftButton)
+        self.assertTrue(wait_for_signal(created, 60000),
+                        wizard.error_label.text() + (failures.at(0)[0] if failures.count() else ''))
+        project = created.at(0)[0]
+        project_root = self.paths.root / project.relative_path
+        dictionary = json.loads((project_root / '10_analysis/source-0001-dictionary.json')
+                                .read_text(encoding='utf-8'))
+        self.assertEqual('充电电量', dictionary['sheet_name'])
+        self.assertEqual(original_hash, sha256(multi))
+
+    def test_single_sheet_xlsx_has_no_combo_and_broken_xlsx_fails_closed(self):
+        from openpyxl import Workbook
+        single = Path(self.temp.name) / 'single.xlsx'
+        book = Workbook()
+        book.active.title = '唯一表'
+        book.active.append(('x', 'y'))
+        book.active.append((1, 2))
+        book.save(single)
+        book.close()
+        broken = Path(self.temp.name) / 'broken.xlsx'
+        broken.write_bytes(b'not a zip')
+
+        wizard = self._make_wizard()
+        wizard.set_source_files((single,))
+        self.assertEqual({'single.xlsx': '唯一表'}, wizard.sheet_selection)
+        self.assertIsNone(self._combo(wizard))
+
+        wizard.set_source_files((single, broken))
+        self.assertIn('工作表', wizard.error_label.text())
+        self.assertEqual((), wizard.source_files)
+        self.assertEqual({}, wizard.sheet_selection)
+        self.assertFalse(wizard.create_button.isEnabled())
 
     def test_two_docx_data_files_can_be_selected_together(self):
         wizard = self._make_wizard()

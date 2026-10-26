@@ -2,17 +2,17 @@
 
 ## 交付
 
-- 桌面版快捷方式所指目录已原位替换为修复包；本机部署路径不公开。
-- 已保留旧版目录备份；本机备份路径不公开。
-- 新版 EXE SHA-256 已在本地校验，具体值不公开。
-- 沙箱运行入口 SHA-256 已在本地校验，具体值不公开。
+- 桌面版快捷方式所指目录已原位替换为修复包：`[本机路径已省略]`。
+- 已保留旧版目录备份：`[本机路径已省略]`。
+- 新版 EXE SHA-256：`[本地发布哈希已省略]`。
+- 沙箱运行入口 SHA-256：`[本地发布哈希已省略]`。
 - 新版和部署后目录均按发布清单核对了 7,910 个文件；部署后的冻结启动检查退出码为 0，报告 `status=ok`、`frozen=true`，9 个受管路径都位于 F 盘。桌面 GUI 已启动，窗口标题“数模论文工作台”，进程仍在运行并响应。
 
 ## 本次运行
 
-本地项目（<project-id>）的运行（<run-id>）已完成全部 9 个阶段：preflight、data_profile、problem_decomposition、model_proposal、code_generation、calculation、result_validation、paper_drafting、docx_qa。运行数据库状态为 completed，检查点有效，31 个产物均已按大小和 SHA-256 校验。
+用户项目 `[运行/项目 ID 已省略]` 的运行 `[运行/项目 ID 已省略]` 已完成全部 9 个阶段：preflight、data_profile、problem_decomposition、model_proposal、code_generation、calculation、result_validation、paper_drafting、docx_qa。运行数据库状态为 `completed`，检查点有效，31 个产物均已按大小和 SHA-256 校验。
 
-论文草稿：projects/<project-id>/90_runs/<run-id>/60_paper/paper-v0001.docx；内容哈希已在本地校验，具体值不公开。
+论文草稿：`[本机路径已省略]`，SHA-256：`[本地发布哈希已省略]`。
 
 DOCX 包结构检查通过：没有损坏关系、缺失章节/图表/证据或未替换占位符。用 LibreOffice 导出 16 页 PDF 并逐页渲染为 PNG 后目视检查，没有空白页或明显裁切。论文仍是待人工审阅的草稿：标题和人工复核标记保留；模型、假设、结论和证据关联需要核实；数学正确性未验证；本次使用软件内置模板，没有验收用户自定义模板。计算示例中的几何图是合成示意，不代表真实性能结论。
 

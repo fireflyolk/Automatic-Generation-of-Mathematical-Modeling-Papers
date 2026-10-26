@@ -8,22 +8,15 @@
 - **DeepSeek API**：从 `DEEPSEEK_API_KEY` 进程环境变量读取密钥。应用不保存密钥；开始运行前显示外发数据范围，并要求本次运行的费用授权。修改环境变量后应完全退出并重新启动应用。
 - Claude Code 已按用户决定从活动选项移除。
 
-## 运行 v7 预览版
+## 本机运行
 
 ```powershell
-$exe = 'F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-codex-deepseek-20261017-v7\MathModelPaperStudio\MathModelPaperStudio.exe'
+$exe = Read-Host '输入 MathModelPaperStudio.exe 的完整路径'
 Start-Process -FilePath $exe
 ```
 
-应用数据默认保存在 `F:\Codex另一个工作的地方\mathmodel-paper-studio-data`；日志、缓存、临时文件和运行结果也受 F: 路径策略约束。F: 不可用时应用不会回退到 C:。
+项目、日志、缓存、临时文件和运行产物位于应用配置的数据根目录。请保持配置的数据盘可用；程序不会在 F: 不可用时回退到 C:。
 
-## 尚未通过的运行门禁
+## 发布验收记录
 
-- 受控 Python 运行器仍因 Windows `STATUS_ACCESS_DENIED` 保持 fail-closed。工作流可生成代码草稿，但会在计算阶段暂停，不会生成最终 Word。
-- Word 的 6 页合成夹具已通过页面检查；用户最终模板尚未渲染验收。
-- v7 是预览包，不是正式 MVP 发布。完整 pytest 为 396 passed、1 skipped；受控 Python 执行与用户最终 Word 模板仍未验收，详细证据见[发布验收记录](docs/release/acceptance.md)。
-
-## v7 预览包
-
-- EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-codex-deepseek-20261017-v7\MathModelPaperStudio\MathModelPaperStudio.exe`
-- SHA-256：`FB2C71109259AC1269CEADEAFE19253251CEF2EA15C8046A8F9990AC70C424A1`
+功能和验收状态以 `docs/release/` 中的记录为准。此公开副本已省略机器相关的绝对路径、运行/项目标识和发布物哈希。

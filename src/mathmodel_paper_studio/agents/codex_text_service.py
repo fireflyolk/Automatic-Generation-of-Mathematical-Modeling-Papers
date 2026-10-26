@@ -72,6 +72,8 @@ class _Registration:
 class CodexTextService:
     """Fresh no-environment preflight and consent-bound text generation."""
 
+    supports_output_schema = True
+
     def __init__(self, paths: AppPaths, *, installation_root=DEFAULT_INSTALLATION_ROOT,
                  transport_factory=None):
         if not isinstance(paths, AppPaths):
@@ -352,21 +354,24 @@ class CodexTextService:
             raise CodexScopeError('阶段上下文题目证据字段不一致。')
         return registration
 
-    def generate(self, context: StageContext, prompt: str, cancel_event=None) -> str:
-        return self._generate(context, prompt, cancel_event)
+    def generate(self, context: StageContext, prompt: str, cancel_event=None,
+                 *, output_schema=None) -> str:
+        return self._generate(context, prompt, cancel_event, output_schema=output_schema)
 
     def generate_with_progress(self, context: StageContext, prompt: str, cancel_event=None,
-                              *, event_callback) -> str:
+                              *, event_callback, output_schema=None) -> str:
         if not callable(event_callback):
             raise CodexScopeError('Codex 进度回调无效。')
         run_id = getattr(context, 'run_id', None)
         if not isinstance(run_id, str):
             raise CodexScopeError('Codex 运行标识无效。')
         self._emit_progress_event(event_callback, run_id, EventKind.STARTED)
-        redactor = _Redactor(
-            prompt.replace('@', '＠'),
-            (prompt, getattr(context, 'authorized_problem', '') or ''),
-        )
+        # The observer is a local view of the user's own authorized run. The
+        # prompt and selected problem are user content, not credentials; using
+        # them as literal redaction rules masks ordinary words and punctuation
+        # from generated JSON/code. Keep marker-based credential and local-path
+        # redaction from _Redactor, without hiding prompt/data echoes.
+        redactor = _Redactor('', ())
         observed = []
 
         def on_agent_text(item_id, delta):
@@ -377,7 +382,8 @@ class CodexTextService:
             self._emit_agent_text(event_callback, run_id, item_id, safe)
 
         try:
-            result = self._generate(context, prompt, cancel_event, on_agent_text=on_agent_text)
+            result = self._generate(context, prompt, cancel_event, on_agent_text=on_agent_text,
+                                    output_schema=output_schema)
             if not observed:
                 self._emit_agent_text(event_callback, run_id, None,
                                       redactor.clean(result, 'agent-message', final=False))
@@ -425,7 +431,7 @@ class CodexTextService:
                 return
 
     def _generate(self, context: StageContext, prompt: str, cancel_event=None,
-                  *, on_agent_text=None) -> str:
+                  *, on_agent_text=None, output_schema=None) -> str:
         if (not isinstance(prompt, str) or not prompt.strip() or '\0' in prompt
                 or len(prompt.encode('utf-8')) > _MAX_PROMPT_BYTES):
             raise CodexScopeError('Codex 文本请求为空或超过上限。')
@@ -443,6 +449,8 @@ class CodexTextService:
         try:
             transport = self._transport(install)
             observer = {'on_agent_text': on_agent_text} if on_agent_text is not None else {}
+            if output_schema is not None:
+                observer = {**observer, 'output_schema': output_schema}
             if preference is None:
                 result = transport.generate(safe_prompt, cancel_event, **observer)
             else:

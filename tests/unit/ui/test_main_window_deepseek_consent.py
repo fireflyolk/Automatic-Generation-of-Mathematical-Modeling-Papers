@@ -18,7 +18,7 @@ from mathmodel_paper_studio.ui.main_window import MainWindow
 from mathmodel_paper_studio.workflow.progress import ProgressKind
 from mathmodel_paper_studio.workflow.stages import ArtifactDigest
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\ui-deepseek-consent')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-run-sidebar\ui-deepseek-consent')
 APP = None
 
 

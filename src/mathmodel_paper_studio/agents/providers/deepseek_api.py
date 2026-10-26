@@ -41,7 +41,7 @@ _PORT = 443
 # longer in provider-side reasoning, especially with reasoning_effort=max.
 _REQUEST_TIMEOUT_SECONDS = 45.0
 # Long-form paper batches need more wall time than the ordinary 8K responses.
-_GENERATION_TIMEOUT_SECONDS = 1800.0
+_GENERATION_TIMEOUT_SECONDS = 3600.0
 _MAX_STREAM_LINE_BYTES = 64 * 1024
 _HTTP_DIAGNOSTIC_STATUSES = frozenset({
     400, 401, 402, 403, 404, 408, 413, 422, 429, 500, 502, 503, 504,
@@ -52,6 +52,8 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 # Its transport budget is separate from the bounded final answer and JSON body.
 _MAX_STREAM_RESPONSE_BYTES = 128 * 1024 * 1024
 _MAX_RESULT_BYTES = 1024 * 1024
+_PREVIEW_BATCH_BYTES = 2048
+_PREVIEW_BATCH_SECONDS = 0.1
 _MAX_OUTPUT_TOKENS = APPLICATION_MAX_OUTPUT_TOKENS
 _MAX_JSON_NODES = 12000
 _KEY_PATTERN = re.compile(r'^[\x21-\x7e]{1,4096}$')
@@ -68,7 +70,7 @@ _EXTERNAL_NOTICE = (
     '请求头发送，不写入项目文件。'
 )
 _CAPABILITIES = AdapterCapabilities(
-    streaming=False,
+    streaming=True,
     cancellation=True,
     filesystem_confinement=True,
     network_behavior='fixed_https_api_only',
@@ -339,17 +341,96 @@ def _validate_prompt(prompt):
     return encoded
 
 
-def _emit_text_chunks(emit, text):
-    remaining = text
-    while remaining:
-        encoded = remaining.encode('utf-8')
-        if len(encoded) <= 64 * 1024:
-            chunk, remaining = remaining, ''
-        else:
-            chunk = encoded[:64 * 1024].decode('utf-8', errors='ignore')
-            remaining = encoded[len(chunk.encode('utf-8')):].decode('utf-8')
-        if chunk:
-            emit(EventKind.TEXT, chunk)
+class _VisiblePreview:
+    """Best-effort, bounded batches of visible text for one generation call.
+
+    The redactor is initialized from the key actually used by each HTTP attempt.
+    Display failures disable previews and cannot change the returned generation.
+    """
+
+    def __init__(self, run_id, callback, is_authorized, cancel_event):
+        self.run_id = run_id
+        self.callback = callback
+        self.is_authorized = is_authorized
+        self.cancel_event = cancel_event
+        self.redactor = None
+        self.pending = ''
+        self.last_emit = 0.0
+        self.disabled = False
+
+    def _active(self):
+        return (self.is_authorized()
+                and (self.cancel_event is None or not self.cancel_event.is_set()))
+
+    def emit(self, kind, text=''):
+        terminal_error = kind in (EventKind.CANCELLED, EventKind.BLOCKED, EventKind.FAILED)
+        if not terminal_error and not self._active():
+            return False
+        if kind is EventKind.TEXT and self.disabled:
+            return False
+        try:
+            self.callback(AgentEvent(self.run_id, kind, text=text))
+            return True
+        except Exception:
+            self.disabled = True
+            self.pending = ''
+            return False
+
+    def begin(self, request_key):
+        self.pending = ''
+        self.last_emit = time.monotonic() - _PREVIEW_BATCH_SECONDS
+        try:
+            # The prompt and authorized problem are user content. They can be
+            # echoed in a valid draft and must remain readable in the observer;
+            # redact the actual request key and credential-shaped strings only.
+            self.redactor = _Redactor('', (request_key,))
+        except Exception:
+            self.disabled = True
+            self.redactor = None
+
+    def add(self, content):
+        if self.disabled or self.redactor is None or not self._active():
+            return
+        try:
+            safe = self.redactor.clean(content, 'deepseek-message', final=False)
+            self.pending += safe
+            due = time.monotonic() - self.last_emit >= _PREVIEW_BATCH_SECONDS
+            if len(self.pending.encode('utf-8')) >= _PREVIEW_BATCH_BYTES or due:
+                self.flush(force=due)
+        except Exception:
+            self.disabled = True
+            self.pending = ''
+
+    def flush(self, *, force=True):
+        pending, self.pending = self.pending, ''
+        encoded = pending.encode('utf-8')
+        while encoded and not self.disabled:
+            if not force and len(encoded) < _PREVIEW_BATCH_BYTES:
+                self.pending = encoded.decode('utf-8')
+                break
+            chunk = encoded[:_PREVIEW_BATCH_BYTES].decode('utf-8', errors='ignore')
+            encoded = encoded[len(chunk.encode('utf-8')):]
+            if not self.emit(EventKind.TEXT, chunk):
+                break
+        self.last_emit = time.monotonic()
+
+    def retrying(self):
+        # Retain only already-safe text. An unfinished redaction candidate is
+        # discarded; it must never be joined to text from a different attempt.
+        self.flush()
+        self.pending = ''
+        self.redactor = None
+        self.emit(EventKind.RETRYING, '输出达到本次上限；上一份实时草稿已丢弃，正在重试。')
+
+    def finish(self):
+        if self.disabled or self.redactor is None or not self._active():
+            return
+        try:
+            self.pending += self.redactor.clean('', 'deepseek-message', final=True)
+            self.flush()
+        except Exception:
+            self.disabled = True
+            self.pending = ''
 
 
 def _context_names(context, attribute, maximum):
@@ -564,45 +645,49 @@ class DeepSeekApiClient:
         run_id, _, _, _ = _validate_context(context)
         if not callable(event_callback):
             raise ValueError('DeepSeek 进度回调无效。')
-        prompt_text = _validate_prompt(prompt).decode('utf-8')
-        redactor = _Redactor(
-            prompt_text, (getattr(context, 'authorized_problem', '') or '',),
+        _validate_prompt(prompt)
+        preview = _VisiblePreview(
+            run_id, event_callback, lambda: self._is_authorized(run_id), cancel_event,
         )
 
-        def emit(kind, text=''):
-            try:
-                event_callback(AgentEvent(run_id, kind, text=text))
-            except Exception:
-                return
-
         def request_sent():
-            emit(EventKind.STARTED)
+            preview.emit(EventKind.STARTED)
 
         try:
             content = self._generate_with_output_retry(
-                context, prompt, cancel_event, on_request_sent=request_sent)
+                context, prompt, cancel_event, on_request_sent=request_sent, preview=preview)
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
             if not self._is_authorized(run_id):
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。')
-            visible = redactor.clean(content, 'deepseek-message', final=True)
-            _emit_text_chunks(emit, visible)
-            emit(EventKind.COMPLETED)
+            preview.finish()
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
+            if not self._is_authorized(run_id):
+                raise _SafeRuntimeError('DeepSeek 运行授权已撤销，部分结果已丢弃。')
+            preview.emit(EventKind.COMPLETED)
             return content
         except Exception as exc:
+            # Publish only already-redacted, complete chunks before reporting
+            # failure; any unfinished credential-prefix candidate stays held.
+            try:
+                preview.flush()
+            except Exception:
+                preview.disabled = True
+                preview.pending = ''
             if cancel_event is not None and cancel_event.is_set():
-                emit(EventKind.CANCELLED)
+                preview.emit(EventKind.CANCELLED)
             elif isinstance(exc, _SafeRuntimeError):
-                emit(EventKind.BLOCKED)
+                preview.emit(EventKind.BLOCKED)
             else:
-                emit(EventKind.FAILED)
+                preview.emit(EventKind.FAILED)
             raise
 
     def _generate_with_output_retry(self, context, prompt, cancel_event=None, *,
-                                    on_request_sent=None):
+                                    on_request_sent=None, preview=None):
         try:
             return self._generate(
-                context, prompt, cancel_event, on_request_sent=on_request_sent)
+                context, prompt, cancel_event, on_request_sent=on_request_sent, preview=preview)
         except _SafeClientError as exc:
             if exc.diagnostic_code != 'output_limit':
                 raise
@@ -617,14 +702,17 @@ class DeepSeekApiClient:
         first_limit, retry_limit = deepseek_output_token_limits(preference)
         if retry_limit <= first_limit:
             raise first_error
+        if preview is not None:
+            preview.retrying()
         return self._generate(
             context, prompt, cancel_event,
             on_request_sent=on_request_sent,
             max_output_tokens=retry_limit,
+            preview=preview,
         )
 
     def _generate(self, context, prompt, cancel_event=None, *, on_request_sent=None,
-                  max_output_tokens=None):
+                  max_output_tokens=None, preview=None):
         run_id, _, rules, trust_notice = _validate_context(context)
         prompt_bytes = _validate_prompt(prompt)
         if cancel_event is not None and not callable(getattr(cancel_event, 'is_set', None)):
@@ -669,6 +757,8 @@ class DeepSeekApiClient:
             )
             if key.encode('ascii') in body:
                 raise _SafeClientError('请求内容疑似包含本机 API 凭据，已阻止发送。')
+            if preview is not None:
+                preview.begin(key)
             tls_context = ssl.create_default_context()
             if tls_context.verify_mode != ssl.CERT_REQUIRED or not tls_context.check_hostname:
                 raise _SafeClientError('DeepSeek TLS 证书验证未启用。')
@@ -716,9 +806,12 @@ class DeepSeekApiClient:
                 raise _SafeClientError('DeepSeek 服务未完成请求。', diagnostic_code=code)
             get_header = getattr(response, 'getheader', None)
             content_type = get_header('Content-Type', '') if callable(get_header) else ''
-            if (isinstance(content_type, str)
-                    and content_type.split(';', 1)[0].strip().lower() == 'text/event-stream'):
-                content = self._extract_stream_content(response)
+            is_stream = (isinstance(content_type, str)
+                         and content_type.split(';', 1)[0].strip().lower() == 'text/event-stream')
+            if is_stream:
+                content = self._extract_stream_content(
+                    response, on_content_delta=preview.add if preview is not None else None,
+                )
             else:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
                 if not isinstance(raw, bytes) or len(raw) > _MAX_RESPONSE_BYTES:
@@ -730,6 +823,8 @@ class DeepSeekApiClient:
                 raise _SafeRuntimeError('DeepSeek 运行授权已撤销。')
             if key in content:
                 raise _SafeClientError('DeepSeek 响应疑似包含本机 API 凭据，已丢弃。')
+            if preview is not None and not is_stream:
+                preview.add(content)
             if cancel_event is not None and cancel_event.is_set():
                 raise _SafeRuntimeError('DeepSeek 请求已取消，部分结果已丢弃。')
             if not self._is_authorized(run_id):
@@ -864,7 +959,7 @@ class DeepSeekApiClient:
             return self._authorized_run_id == run_id
 
     @staticmethod
-    def _extract_stream_content(response):
+    def _extract_stream_content(response, *, on_content_delta=None):
         read_chunk = getattr(response, 'read1', None)
         if not callable(read_chunk):
             raise _invalid_response()
@@ -922,6 +1017,12 @@ class DeepSeekApiClient:
                 finish_reason = reason
                 if reason in ('tool_calls', 'function_call'):
                     raise _invalid_response()
+            if piece and callable(on_content_delta):
+                try:
+                    on_content_delta(piece)
+                except Exception:
+                    # A display observer cannot affect the provider result.
+                    pass
 
         def consume_line(line):
             if line.endswith(b'\r'):

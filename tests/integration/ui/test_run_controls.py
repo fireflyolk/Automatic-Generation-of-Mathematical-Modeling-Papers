@@ -29,7 +29,7 @@ from mathmodel_paper_studio.ui.workers import FunctionWorker
 from mathmodel_paper_studio.workflow.progress import ProgressKind
 from tests.fixtures.docx.fixture_factory import write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\ui-run-controls')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-run-sidebar\ui-run-controls')
 APP = None
 
 

@@ -10,7 +10,7 @@ from mathmodel_paper_studio.paper.template_inspector import (
 )
 from tests.fixtures.docx.fixture_factory import DOCUMENT_XML, write_fixture, unsupported_object, unsupported_text_box
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 class TemplateInspectorTests(unittest.TestCase):
@@ -46,6 +46,17 @@ class TemplateInspectorTests(unittest.TestCase):
     def test_template_read_uses_bounded_streaming_not_read_bytes(self):
         with patch.object(Path, 'read_bytes', side_effect=AssertionError('unbounded read')):
             inspection = inspect_template(self.path)
+        self.assertEqual(hashlib.sha256(self.path.read_bytes()).hexdigest(), inspection.template_sha256)
+
+    def test_inspection_accepts_read_only_template_sources_on_other_local_drives(self):
+        source = Path(r'D:\Documents\template.docx')
+        with patch('mathmodel_paper_studio.paper.template_inspector.validate_import_source_path',
+                   return_value=self.path, create=True) as validate_source, \
+                patch('mathmodel_paper_studio.paper.template_inspector.validate_managed_path',
+                      side_effect=AssertionError('managed storage validator used for source file'),
+                      create=True):
+            inspection = inspect_template(source)
+        validate_source.assert_called_once_with(source)
         self.assertEqual(hashlib.sha256(self.path.read_bytes()).hexdigest(), inspection.template_sha256)
 
     def test_rejects_malformed_packages_and_unsupported_text_boxes_or_objects(self):

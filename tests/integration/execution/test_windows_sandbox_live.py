@@ -20,9 +20,9 @@ from mathmodel_paper_studio.execution.result_validation import ArtifactExpectati
 from mathmodel_paper_studio.execution.windows_sandbox import WindowsSandboxExecutor
 
 
-F_WORKSPACE = Path(r"F:\Codex另一个工作的地方")
+F_WORKSPACE = Path(r"F:\MathModelPaperStudio")
 RUNTIME_DEFAULT = Path(
-    r"F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261018"
+    r"F:\MathModelPaperStudio\downloads\mathmodel-paper-studio-sandbox-20261018"
     r"\computation-runtime-final"
 )
 

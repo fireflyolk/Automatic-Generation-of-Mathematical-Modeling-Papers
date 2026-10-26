@@ -6,7 +6,7 @@ from mathmodel_paper_studio.inputs.docx_reader import read_docx
 from mathmodel_paper_studio.inputs.profiling import ImportLimits
 from tests.fixtures.docx.fixture_factory import write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 class DocxReaderTests(unittest.TestCase):

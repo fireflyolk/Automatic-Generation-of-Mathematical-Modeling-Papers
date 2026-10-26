@@ -13,7 +13,7 @@ from mathmodel_paper_studio.agents.deepseek_model_preferences import (
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-deepseek-preferences-tests')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-deepseek-preferences-tests')
 
 
 def _store():

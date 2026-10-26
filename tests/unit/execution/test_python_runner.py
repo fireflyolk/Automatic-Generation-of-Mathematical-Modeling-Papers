@@ -13,7 +13,7 @@ from mathmodel_paper_studio.execution.python_runner import PythonRunner, RunArti
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
 from mathmodel_paper_studio.execution.windows_sandbox import SandboxExecutionResult
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 def make_layout(test):

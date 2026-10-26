@@ -34,7 +34,7 @@ class _FakeWindow:
 
 
 class DesktopLaunchWiringTests(unittest.TestCase):
-    ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-gates-20261017\launch-wiring')
+    ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-gates-20261017\launch-wiring')
 
     def test_frozen_app_starts_from_approved_c_install_with_all_data_paths_on_f(self):
         installation = Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'MathModelPaperStudio'
@@ -69,7 +69,7 @@ class DesktopLaunchWiringTests(unittest.TestCase):
     def test_runtime_entry_verifier_accepts_matching_protocol_source(self):
         verifier = getattr(verify_f_drive_outputs, 'verify_runtime_entry', None)
         self.assertTrue(callable(verifier), 'runtime entry compatibility verifier is missing')
-        with TemporaryDirectory(dir=Path(r'F:\Codex另一个工作的地方\tmp')) as temp:
+        with TemporaryDirectory(dir=Path(r'F:\MathModelPaperStudio\tmp')) as temp:
             root = Path(temp)
             source = root / 'source-sandbox-entry.py'
             bundled = root / 'runtime' / 'sandbox_entry.py'
@@ -84,7 +84,7 @@ class DesktopLaunchWiringTests(unittest.TestCase):
     def test_runtime_entry_verifier_rejects_stale_launcher(self):
         verifier = getattr(verify_f_drive_outputs, 'verify_runtime_entry', None)
         self.assertTrue(callable(verifier), 'runtime entry compatibility verifier is missing')
-        with TemporaryDirectory(dir=Path(r'F:\Codex另一个工作的地方\tmp')) as temp:
+        with TemporaryDirectory(dir=Path(r'F:\MathModelPaperStudio\tmp')) as temp:
             root = Path(temp)
             source = root / 'source-sandbox-entry.py'
             bundled = root / 'runtime' / 'sandbox_entry.py'

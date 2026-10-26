@@ -2,8 +2,8 @@
 
 ## 验收对象与边界
 
-- 冻结 EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-fluent-20261017\release\MathModelPaperStudio\MathModelPaperStudio.exe`
-- SHA-256：`B46BF49F834277CE041558065F8269EB849C12B932BBE0B78DC48DEF7F0D878D`
+- 冻结 EXE：`[本机路径已省略]`
+- SHA-256：`[本地发布哈希已省略]`
 - 使用合成项目和夹具，数据、日志、截图均位于 F:；没有发送外部 API 请求或触碰用户项目。
 
 ## 已通过的包级验收
@@ -11,9 +11,9 @@
 - 冻结 EXE 启动并保持响应，窗口标题为“数模论文工作台”。实际桌面鼠标依次点击了项目、Word 模板、运行与审核、设置四个导航项；每次点击后均观察到对应页面内容。测试后恢复原光标位置。
 - 在项目页重新载入隔离项目，并看到题目、CSV、DOCX 和运行输入列表。
 - 模板页“选择模板”打开 Windows 文件选择器，地址定位到当前项目的 `00_inputs`。选择导入的 `source-0002-v0001.docx` 后，页面显示检查完成：2 个标题锚点、1 个表格锚点。
-- 章节映射下拉框提供“不映射”“摘要（Heading1）”“结果（Heading1）”等候选。将“摘要”映射到标题锚点 `heading-0000-2a7a96416f` 后，保存按钮启用且成功写出映射文件：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\elevated-package-acceptance\data\projects\a43f5c3db0ea432f813c4de9cf6e39de\70_review\template-mapping-v0001.json`。
-- 映射 JSON 可解析，包含 `abstract` 到上述标题锚点的唯一绑定；其中的模板 SHA-256 与项目内 DOCX 实测哈希一致：`55154B181D4CD1A35BA70167FA59D379B7EB9A4E93E779A3BE1183AA11D35227`。映射文件 SHA-256：`2E86D1C94554709D88FE679D211024D381A4DCA6945649FA019FC1162DA62B83`。
-- 页面截图：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\elevated-package-acceptance\artifacts\fluent-template-mapping-package.png`；SHA-256：`1F54BD94DCF64D44889835186838053456C9EF46E17F34EBF00548EB6803E7C0`。截图可见模板检查成功状态和已选章节映射。
+- 章节映射下拉框提供“不映射”“摘要（Heading1）”“结果（Heading1）”等候选。将“摘要”映射到标题锚点 `heading-0000-2a7a96416f` 后，保存按钮启用且成功写出映射文件：`[本机路径已省略]`。
+- 映射 JSON 可解析，包含 `abstract` 到上述标题锚点的唯一绑定；其中的模板 SHA-256 与项目内 DOCX 实测哈希一致：`[本地发布哈希已省略]`。映射文件 SHA-256：`[本地发布哈希已省略]`。
+- 页面截图：`[本机路径已省略]`；SHA-256：`[本地发布哈希已省略]`。截图可见模板检查成功状态和已选章节映射。
 - 当前 Windows DPI 为 120（125%），单显示器 2560×1440；在此实际显示环境下检查了导航和模板映射页布局。测试 EXE（PID 66544）已正常关闭，原有 PID 2664 未触碰。
 - 合成项目创建、CSV/DOCX 导入副本哈希和 SQLite `integrity_check=ok` 见本目录先前记录；本轮未改动该项目数据库。
 

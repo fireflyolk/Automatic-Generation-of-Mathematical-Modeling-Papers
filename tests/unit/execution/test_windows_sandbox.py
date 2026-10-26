@@ -19,7 +19,7 @@ from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation
 
 
-WORKSPACE = Path(r'F:\Codex另一个工作的地方')
+WORKSPACE = Path(r'F:\MathModelPaperStudio')
 
 
 def make_layout(test):
@@ -39,7 +39,7 @@ def make_layout(test):
 
 class WindowsSandboxConfigurationTests(unittest.TestCase):
     def test_source_runtime_uses_explicit_f_drive_configuration(self):
-        runtime = r'F:\Codex另一个工作的地方\downloads\computation-runtime'
+        runtime = r'F:\MathModelPaperStudio\downloads\computation-runtime'
         with patch.dict(os.environ, {'MMPS_COMPUTATION_RUNTIME_ROOT': runtime}):
             resolver = getattr(windows_sandbox, 'resolve_computation_runtime_root', None)
             self.assertTrue(callable(resolver), 'source runtime resolver is missing')
@@ -196,7 +196,7 @@ class WindowsSandboxConfigurationTests(unittest.TestCase):
             self.assertTrue(unexpected)
 
     def test_cleanup_removes_read_only_snapshot_files_after_sandbox_stops(self):
-        workspace_tmp = Path(r'F:\Codex另一个工作的地方\tmp')
+        workspace_tmp = Path(r'F:\MathModelPaperStudio\tmp')
         with tempfile.TemporaryDirectory(dir=workspace_tmp) as temp_root:
             work_root = Path(temp_root) / 'sandbox'
             input_root = work_root / 'input'
@@ -224,7 +224,7 @@ class WindowsSandboxConfigurationTests(unittest.TestCase):
             self.assertFalse(work_root.exists())
 
     def test_stop_reconciles_absent_session_even_when_stop_command_fails(self):
-        cli = Path(r'F:\Codex另一个工作的地方\wsb.exe')
+        cli = Path(r'F:\MathModelPaperStudio\wsb.exe')
         failed = __import__('subprocess').CompletedProcess([], 1, '', 'already stopped')
         with patch('mathmodel_paper_studio.execution.windows_sandbox.subprocess.run',
                    return_value=failed), patch(

@@ -156,7 +156,7 @@ class RunReviewModel:
         if standard.minimum_pages is not None and standard.maximum_pages is not None:
             lines[4:4] = [
                 f'论文篇幅目标：{standard.minimum_pages}–{standard.maximum_pages} 页，中心目标 {standard.target_pages} 页；需 Word 渲染才能确认页数。',
-                f'内容规划：约 {standard.target_body_characters:,} 字、{standard.recommended_equation_count} 个有效公式、至少 {standard.recommended_flowchart_count} 张流程图；不足时显示建议，不阻断运行。',
+                f'内容规划：约 {standard.target_body_characters:,} 字正文（不含表格单元格），验收最低 {standard.minimum_body_characters:,} 字；逐题完成论证，公式和图表按需生成。',
                 ('分章起草：最多 8 个分章请求；JSON 格式纠正时每段可能重试一次，'
                  + ('DeepSeek 长度截断还可能重试一次，最坏共 32 次 Agent 请求。'
                     if status.provider is Provider.DEEPSEEK else '最坏共 16 次 Agent 请求。')

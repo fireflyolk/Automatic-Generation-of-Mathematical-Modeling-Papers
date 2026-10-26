@@ -2,7 +2,7 @@
 
 状态：用户已审阅并批准书面规格；实施计划编写中
 日期：2026-10-15
-项目目录：F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-20261015
+项目目录：[本机路径已省略]
 
 ## 1. 产品目标
 
@@ -101,7 +101,7 @@
   - mathmodel-paper-studio-20261015/projects/<project-id>/60_paper/
   - mathmodel-paper-studio-20261015/projects/<project-id>/90_runs/
   - mathmodel-paper-studio-20261015/docs/superpowers/specs/
-- **临时文件**：应用临时目录指向 F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015。应用不得静默把项目输入、日志、缓存或生成文件写到 C 盘。
+- **临时文件**：应用临时目录指向 [本机路径已省略]。应用不得静默把项目输入、日志、缓存或生成文件写到 C 盘。
 - 各 CLI 原生安装和认证状态由其本身管理；应用不复制或修改其凭据文件。实现时需核对各 CLI 的临时目录/缓存行为，不能声称应用控制了 CLI 自身的所有文件写入。
 
 ## 6. 数据流与隐私提示
@@ -149,9 +149,9 @@
 
 本设计基于先前对 MathModel 桌面程序的只读静态分析，重点借鉴本地 Agent 适配、项目隔离、阶段检查点和论文生成工作流概念；不复制其打包源码。
 
-- F:\Codex另一个工作的地方\downloads\mathmodel-analysis-20261015\mathmodel-static-report.md
-- F:\Codex另一个工作的地方\downloads\mathmodel-analysis-20261015\mathmodel-static-report-addendum.md
-- F:\Codex另一个工作的地方\downloads\mathmodel-analysis-20261015\mathmodel-agent-execution-and-snapshots.md
+- [本机路径已省略]
+- [本机路径已省略]
+- [本机路径已省略]
 
 ## 范围变更（2026-10-17）
 

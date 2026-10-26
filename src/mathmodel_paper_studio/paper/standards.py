@@ -36,6 +36,7 @@ class PaperStandard:
     minimum_pages: int | None = None
     maximum_pages: int | None = None
     target_body_characters: int | None = None
+    minimum_body_characters: int | None = None
     recommended_equation_count: int | None = None
     recommended_flowchart_count: int | None = None
 
@@ -55,12 +56,16 @@ class PaperStandard:
             raise ValueError('Minimum pages must not exceed maximum pages.')
         bounded_targets = (
             (self.target_body_characters, 0, 1_000_000),
+            (self.minimum_body_characters, 0, 1_000_000),
             (self.recommended_equation_count, 0, 256),
             (self.recommended_flowchart_count, 0, 64),
         )
         if any(value is not None and (type(value) is not int or not low <= value <= high)
                for value, low, high in bounded_targets):
             raise ValueError('Paper content targets are invalid.')
+        if (self.minimum_body_characters is not None and self.target_body_characters is not None
+                and self.minimum_body_characters > self.target_body_characters):
+            raise ValueError('Minimum body characters must not exceed the target.')
         for name in ('required_sections', 'optional_sections'):
             values = getattr(self, name)
             if not isinstance(values, (tuple, list)) or len(values) > 64:
@@ -117,6 +122,7 @@ class PaperStandard:
             'minimum_pages': self.minimum_pages,
             'maximum_pages': self.maximum_pages,
             'target_body_characters': self.target_body_characters,
+            'minimum_body_characters': self.minimum_body_characters,
             'recommended_equation_count': self.recommended_equation_count,
             'recommended_flowchart_count': self.recommended_flowchart_count,
         }
@@ -150,13 +156,13 @@ _LEGACY_STANDARD = PaperStandard(
     content_rules={
         'structure': '按题目组织摘要、关键词、问题重述与分析、假设、符号、建模推导、求解、结果、检验、结论和参考文献；需要时使用十进制小节编号；可合并或调整章节，不写与题目无关的内容。',
         'mathematics': '说明变量、单位、假设、目标与约束；解释关键公式及推导关系；算法交代输入、步骤、停止条件和适用边界。',
-        'evidence': '结果只能来自已选输入或本次运行的已验证产物；区分输入、计算、估算和未验证内容；不得虚构数值、实验、基线或引用。',
-        'figures_tables': '图表与公式编号连续，标题靠近对象；正文解释单位、结果含义及其与结论的关系，不重复图表填充篇幅。',
+        'evidence': '结果只能来自已选输入或本次运行的已验证计算；正文直接给出数值、单位、计算条件和学术解释，不叙述应用运行、内部证据编号、验证表或验证状态。没有测试数据时不报告测试性能，也不在正文说明缺少测试或“尚未验证”；来源追踪与验证状态只写入应用审计信息。不得虚构数值、实验、基线或引用。',
+        'figures_tables': '图表与公式编号连续，标题靠近对象；对有多行定量计算结果的表格，优先加入能解释趋势、变量关系、分布或方案比较的独立图，并在正文解释单位、结果含义及其与结论的关系。只用真实计算值，不重复图表填充篇幅。',
         'reproducibility': '仅在项目实际拥有时纳入代码、数据字典、验证记录或复现步骤；不机械复制未经审核的代码或原始数据。',
-        'references': '只列出有来源依据的参考资料；没有可验证来源时明确提示待补，不生成虚构引用。',
-        'conclusion': '结论逐项回答子问题并说明模型作用、优点、不足和适用范围；未经验证的推测不得写成确定结果。',
-        'length': '约 30 页仅作为内容规划目标；篇幅不足时报告原因和补充建议，不插入空白页、重复段落或无关内容。',
-        'review': '规范检查不等于数学正确性验证；结论、模型假设和科学解释仍需人工复核。',
+        'references': '只列出有来源依据的参考资料；没有可核验来源时不生成引用，也不在论文中放置待补提示，缺口仅记录在应用审计信息。',
+        'conclusion': '结论逐项回答子问题并说明模型作用、优点、不足和适用范围；只报告有证据支持的结果，不把模型输出表述成未开展的实测或测试成绩。',
+        'length': '约 30 页仅作为内容规划目标；按题目和证据充分展开论证，不插入待补说明、空白页、重复段落或无关内容。',
+        'review': '规范检查与数学正确性、引用、科学解释的审计状态分别记录；正文只写正式的模型假设、适用范围与局限，不出现人工复核、待补或工作流提示。',
     },
     style_defaults={
         'page_size': 'A4',
@@ -189,7 +195,7 @@ _LEGACY_STANDARD = PaperStandard(
     },
 )
 
-_DEFAULT_STANDARD = replace(
+_STANDARD_V1_1 = replace(
     _LEGACY_STANDARD,
     version='1.1.0',
     target_pages=45,
@@ -217,8 +223,67 @@ _DEFAULT_STANDARD = replace(
     recommended_flowchart_count=3,
 )
 
+_DEFAULT_STANDARD = replace(
+    _STANDARD_V1_1,
+    version='1.2.0',
+    target_pages=14,
+    minimum_pages=10,
+    maximum_pages=20,
+    target_body_characters=7_500,
+    minimum_body_characters=7_000,
+    recommended_equation_count=None,
+    recommended_flowchart_count=None,
+    content_rules={
+        **dict(_STANDARD_V1_1.content_rules),
+        'structure': (
+            '保留摘要、关键词、问题重述与分析、假设、符号、模型、求解、结果检验、结论和真实来源等论文必要内容；'
+            '正文按题目中的每个子问题设置清楚的小节，不机械套用无关章节或重复内容。'
+        ),
+        'problem_coverage': (
+            '逐项覆盖获批的问题分解；每个子问题都要说明目标与已知条件、模型选择和关键推导、算法或求解步骤、'
+            '由本次验证产物支持的结果、适用的检验与结论。问题间可共享基础模型，但必须说明各自的差异和回答。'
+        ),
+        'mathematics': (
+            '说明变量定义、量纲、假设来源和适用边界；仅在有助于表达模型时使用公式，解释符号及推导关系；'
+            '不以公式数量代替正确性，不拆式凑数。算法说明输入、核心步骤、停止条件和边界。'
+        ),
+        'figures_tables': (
+            '图表只用于呈现已验证的定量结果或解释方法；对有多行定量计算结果的表格，优先加入能解释趋势、变量关系、分布或方案比较的独立图。'
+            '编号与标题清楚，单位和数据范围明确；紧邻正文解释主要模式、与各子问题的关系及其对结论的支持，不重复或添加装饰图。'
+        ),
+        'evidence': (
+            '每个定量结论都应能追溯到已选输入或本次已验证的计算；正文直接给出数值、单位、计算条件和学术解释，不叙述应用运行、内部证据编号、验证表或验证状态。'
+            '没有测试数据时不报告测试性能，也不在正文说明缺少测试或“尚未验证”；来源追踪与验证状态只写入应用审计信息。不得编造数据、实验、基线或文献。'
+        ),
+        'references': (
+            '只列出请求中提供且可核验的来源；没有可核验来源时不生成引用，也不在论文中放置“待补”正文，占位内容和缺口写入应用审计信息。'
+        ),
+        'conclusion': (
+            '按题目顺序回答每个子问题，引用对应的模型和结果；总结适用条件、主要限制及对结果解释的影响，'
+            '只报告有证据支持的结果，不把模型输出表述成未开展的实测或测试成绩。'
+        ),
+        'length': (
+            '正文至少 7,000 字，目标约 7,500 字（不含表格单元格）；10–20 页仅作为已验收终稿的规划范围。'
+            '该终稿正文约 7,439 字、表格约 2,871 字，页数以所选 Word 模板渲染为准。'
+            '按问题复杂度和可用证据完成论证，不插入待补说明、重复、空泛或无关内容。'
+        ),
+        'review': (
+            '数学正确性、引用和待核事项属于应用审计状态；正文只写正式的模型假设、适用范围与局限，不出现人工复核、待补、来源追踪或工作流提示。'
+        ),
+    },
+    stage_rules={
+        **dict(_STANDARD_V1_1.stage_rules),
+        Stage.PAPER_DRAFTING.value: (
+            'structure', 'problem_coverage', 'mathematics', 'evidence', 'figures_tables',
+            'reproducibility', 'references', 'conclusion', 'length',
+        ),
+        Stage.DOCX_QA.value: ('structure', 'problem_coverage', 'figures_tables', 'references', 'conclusion', 'review'),
+    },
+)
+
 _STANDARD_REGISTRY = {
     (_LEGACY_STANDARD.standard_id, _LEGACY_STANDARD.version): _LEGACY_STANDARD,
+    (_STANDARD_V1_1.standard_id, _STANDARD_V1_1.version): _STANDARD_V1_1,
     (_DEFAULT_STANDARD.standard_id, _DEFAULT_STANDARD.version): _DEFAULT_STANDARD,
 }
 

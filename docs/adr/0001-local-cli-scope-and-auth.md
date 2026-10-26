@@ -34,7 +34,7 @@ The coordinating agent ran the installed CLI against disposable markers with:
 Evidence root:
 
 ```text
-F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015\preflight\claude-restricted-root
+[本机路径已省略]
 ```
 
 The structured stream contained one Read call and two Write calls. The outside-root Read and Write returned errors matching a boundary restriction; the outside Write created no file. Inside-root Write succeeded. No shell or MCP tool appeared. This proves only the exercised restricted Read/Write behavior. Shell/code execution remains unavailable. The coordinating agent separately started a provider response, confirmed the CLI was running, and used `taskkill /T /F`: it returned zero and the CLI exited. Temporary cancellation logs were removed. Evidence directories were the restricted fixture root and the task `preflight\cancel` directory. This verifies the tested cancellation path, without claiming that a descendant process existed in this restricted profile.
@@ -77,7 +77,7 @@ Limits are 65,536 UTF-8 bytes per JSON line, 8 MiB per parser run, at most 4,096
 
 No native thread ID is retained by default. Explicit parser-only opt-in can retain one in-memory opaque 1–64-character thread identifier; it grants no scope or resume permission, is cleared on failure, and the disabled adapter never opts in or stores it. No credential/account/session dump, raw stderr, argv, tool input/result, or prompt is logged by the adapter/parser. Native PATH/HOME/login stores and credentials are neither read nor modified by this implementation. The test runner reuses Task3's existing native-process environment policy only for a known F: fake script.
 
-Evidence: 15 unit tests and 5 integration tests execute a bounded deterministic F: Python JSONL fixture through Task3's real native Job runner. They cover split UTF-8/CRLF, complete final JSON without newline, cancellation, timeout, nonzero exit, missing/conflicting/truncated results, redacted stderr and forbidden-tool mismatch. This is parser/lifecycle evidence only. There was no real Codex/provider call, disposable Codex scope probe, outside-root denial proof, auth verification, UI test, generated-code sandbox acceptance, DOCX render, packaged EXE test or Python3.11 run. All tests use the existing F: Python3.13.14 environment; the final focused log is `F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015\task4-final-green-coverage.log` (20/20, 0 skips, exit0; owned module stdlib executable-line coverage183/190=96.3%). No Task0–3 full-suite rerun or branch-coverage claim is made.
+Evidence: 15 unit tests and 5 integration tests execute a bounded deterministic F: Python JSONL fixture through Task3's real native Job runner. They cover split UTF-8/CRLF, complete final JSON without newline, cancellation, timeout, nonzero exit, missing/conflicting/truncated results, redacted stderr and forbidden-tool mismatch. This is parser/lifecycle evidence only. There was no real Codex/provider call, disposable Codex scope probe, outside-root denial proof, auth verification, UI test, generated-code sandbox acceptance, DOCX render, packaged EXE test or Python3.11 run. All tests use the existing F: Python3.13.14 environment; the final focused log is `[本机路径已省略]` (20/20, 0 skips, exit0; owned module stdlib executable-line coverage183/190=96.3%). No Task0–3 full-suite rerun or branch-coverage claim is made.
 
 
 ## Task 5 implementation — Claude Code JSONL parser, production disabled (2026-10-15)

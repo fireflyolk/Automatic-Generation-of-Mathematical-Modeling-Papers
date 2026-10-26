@@ -8,7 +8,7 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.storage.database import Database
 from mathmodel_paper_studio.storage.repositories import ProjectRepository
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 class ProjectImportFlowTests(unittest.TestCase):
     def setUp(self):

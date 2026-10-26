@@ -10,6 +10,7 @@ from mathmodel_paper_studio.security.scope_manifest import RuntimeScope
 
 class EventKind(str, Enum):
     STARTED = 'started'
+    RETRYING = 'retrying'
     TEXT = 'text'
     TOOL_STARTED = 'tool_started'
     TOOL_FINISHED = 'tool_finished'

@@ -2,7 +2,7 @@
 
 状态：用户已通过规格与实施计划；执行中
 日期：2026-10-17（Asia/Shanghai）
-项目：F:\Codex另一个工作的地方\worktrees\mathmodel-paper-studio-impl-20261015
+项目：[本机路径已省略]
 
 ## 1. 目标与已批准方向
 

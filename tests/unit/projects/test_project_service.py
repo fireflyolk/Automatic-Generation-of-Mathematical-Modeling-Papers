@@ -18,7 +18,7 @@ from mathmodel_paper_studio.projects.manifest import latest_manifest
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.storage.database import Database
 from mathmodel_paper_studio.storage.repositories import ProjectRepository, RunRepository
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-project-edit-20261018\unit-project-service')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-project-edit-20261018\unit-project-service')
 class ProjectServiceTests(unittest.TestCase):
     def setUp(self):
         ROOT.mkdir(parents=True, exist_ok=True)

@@ -12,7 +12,7 @@ from mathmodel_paper_studio.agents.codex_model_preferences import (
 from mathmodel_paper_studio.bootstrap.paths import AppPaths, PathPolicyError
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-codex-model-preferences-tests')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-codex-model-preferences-tests')
 
 
 def _temporary_paths():

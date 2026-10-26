@@ -10,7 +10,7 @@ from zipfile import BadZipFile, ZipFile
 from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
-from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
+from mathmodel_paper_studio.bootstrap.paths import validate_import_source_path
 
 _W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
@@ -149,11 +149,11 @@ def _anchor_id(kind: str, index: int, label: str, template_sha256: str) -> str:
 
 
 def inspect_template(path: Path) -> TemplateInspection:
-    """Inspect a DOCX from an F: managed path without extracting or modifying it."""
+    """Inspect a user-selected local DOCX read-only without extracting or modifying it."""
     if not isinstance(path, Path):
         raise TypeError('Template path must be a pathlib.Path.')
     try:
-        path = validate_managed_path(path)
+        path = validate_import_source_path(path)
         if not path.is_file():
             raise TemplateInspectionError('DOCX template is not a regular file.')
         size_bytes = path.stat().st_size

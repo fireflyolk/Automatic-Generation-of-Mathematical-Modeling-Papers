@@ -9,7 +9,7 @@ from mathmodel_paper_studio.execution.limits import ComputationLimits
 from mathmodel_paper_studio.execution.python_runner import RunArtifactLayout
 from mathmodel_paper_studio.execution.result_validation import ArtifactExpectation, ResultValidator
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 def make_layout(test):

@@ -12,7 +12,7 @@ from mathmodel_paper_studio.execution.result_validation import ArtifactExpectati
 from mathmodel_paper_studio.paper.evidence import EvidenceIndex
 from mathmodel_paper_studio.projects.layout import create_layout
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 class ComputationArtifactsTests(unittest.TestCase):

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 
-ENTRY = Path(r'F:\Codex另一个工作的地方\worktrees\mathmodel-paper-studio-impl-20261015\packaging\runtime\sandbox_entry.py')
+ENTRY = Path(r'F:\MathModelPaperStudio\worktrees\mathmodel-paper-studio-impl-20261015\packaging\runtime\sandbox_entry.py')
 SPEC = importlib.util.spec_from_file_location('mmps_sandbox_entry', ENTRY)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -43,7 +43,7 @@ class SandboxEntryFailureTests(unittest.TestCase):
         self.assertNotIn('private', repr(result))
 
     def test_guest_result_is_written_to_shared_output_mapping(self):
-        with tempfile.TemporaryDirectory(dir=Path(r'F:\Codex另一个工作的地方\tmp')) as temp:
+        with tempfile.TemporaryDirectory(dir=Path(r'F:\MathModelPaperStudio\tmp')) as temp:
             output_dir = Path(temp)
             MODULE._write_guest_result(
                 output_dir, 1,

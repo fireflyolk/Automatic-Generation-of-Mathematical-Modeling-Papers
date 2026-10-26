@@ -10,7 +10,7 @@ from mathmodel_paper_studio.domain.models import Project, Run, SourceFile, Stage
 from mathmodel_paper_studio.inputs.csv_reader import read_csv
 from mathmodel_paper_studio.inputs.docx_reader import read_docx
 from mathmodel_paper_studio.inputs.profiling import ImportLimits, profile_table, read_bounded
-from mathmodel_paper_studio.inputs.xlsx_reader import read_xlsx
+from mathmodel_paper_studio.inputs.xlsx_reader import read_xlsx, xlsx_sheet_names
 from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.workflow.stages import ArtifactDigest, PauseReason
 
@@ -28,7 +28,10 @@ _STAGE_INSTRUCTIONS = {
     Stage.CODE_GENERATION: 'Generate reviewable analysis code for the approved model and selected data.',
     Stage.CALCULATION: 'Run only after the trusted calculation gate passes; otherwise pause.',
     Stage.RESULT_VALIDATION: 'Validate required result artifacts and finite values; do not assert mathematical correctness.',
-    Stage.PAPER_DRAFTING: 'Draft a paper from verified evidence and the approved template mapping.',
+    Stage.PAPER_DRAFTING: (
+        'Write a coherent, submission-ready mathematical modeling paper from the approved problem decomposition, '
+        'selected inputs, verified calculations, and approved template mapping. Answer every subproblem explicitly.'
+    ),
     Stage.DOCX_QA: 'Check document structure and evidence links; do not claim visual rendering.',
 }
 _ARTIFACT_INPUTS = {
@@ -38,8 +41,8 @@ _ARTIFACT_INPUTS = {
     Stage.CODE_GENERATION: frozenset((Stage.DATA_PROFILE, Stage.MODEL_PROPOSAL)),
     Stage.CALCULATION: frozenset((Stage.CODE_GENERATION,)),
     Stage.RESULT_VALIDATION: frozenset((Stage.CALCULATION,)),
-    Stage.PAPER_DRAFTING: frozenset((Stage.DATA_PROFILE, Stage.MODEL_PROPOSAL,
-                                    Stage.CALCULATION, Stage.RESULT_VALIDATION)),
+    Stage.PAPER_DRAFTING: frozenset((Stage.DATA_PROFILE, Stage.PROBLEM_DECOMPOSITION, Stage.MODEL_PROPOSAL,
+                                    Stage.CODE_GENERATION, Stage.CALCULATION, Stage.RESULT_VALIDATION)),
     Stage.DOCX_QA: frozenset((Stage.PAPER_DRAFTING, Stage.RESULT_VALIDATION)),
     Stage.PREFLIGHT: frozenset(),
 }
@@ -142,6 +145,44 @@ class ContextBuilder:
         self.selected = tuple(indexed[item] for item in selected)
         self.limits = limits
 
+    def _selected_xlsx_sheet(self, source: SourceFile, content: bytes) -> str:
+        sheet_names = xlsx_sheet_names(content, self.limits)
+        if len(sheet_names) == 1:
+            return sheet_names[0]
+        match = re.fullmatch(r'00_inputs/source-([0-9]{4})-v([0-9]{4})\.xlsx',
+                             source.relative_path, re.IGNORECASE)
+        if match is None:
+            raise ContextInputError(
+                PauseReason.AMBIGUOUS_DATA,
+                'XLSX 包含多个工作表，但无法定位导入时的工作表选择；请重新导入该数据文件。',
+            )
+        version = int(match.group(2))
+        profile_suffix = '' if version == 1 else f'-v{version:04d}'
+        profile_path = validate_managed_path(
+            self.project_root / '10_analysis' /
+            f'source-{match.group(1)}{profile_suffix}-profile.json'
+        )
+        try:
+            if (not profile_path.is_relative_to(self.project_root) or not profile_path.is_file()
+                    or profile_path.stat().st_size > 1024 * 1024):
+                raise ValueError('工作表选择记录缺失或超过大小上限。')
+            profile_bytes = read_bounded(
+                profile_path, ImportLimits(max_file_bytes=1024 * 1024)
+            )
+            profile = json.loads(profile_bytes.decode('utf-8'))
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            raise ContextInputError(
+                PauseReason.AMBIGUOUS_DATA,
+                'XLSX 包含多个工作表，但导入时的工作表选择记录无法读取；请重新导入该数据文件。',
+            ) from exc
+        sheet = profile.get('sheet_name') if isinstance(profile, dict) else None
+        if not isinstance(sheet, str) or sheet not in sheet_names:
+            raise ContextInputError(
+                PauseReason.AMBIGUOUS_DATA,
+                'XLSX 的已选工作表与当前项目副本不匹配；请重新导入该数据文件。',
+            )
+        return sheet
+
     def build(self, stage: Stage, attempt: int = 0, *, upstream_artifacts=(), output_directory=None) -> StageContext:
         stage = Stage(stage)
         if type(attempt) is not int or not 0 <= attempt <= 2:
@@ -173,7 +214,8 @@ class ContextBuilder:
                     table = read_csv(content, limits=self.limits)
                     profile = profile_table(table)
                 elif source.kind == 'xlsx':
-                    table = read_xlsx(content, limits=self.limits)
+                    sheet = self._selected_xlsx_sheet(source, content)
+                    table = read_xlsx(content, sheet=sheet, limits=self.limits)
                     profile = profile_table(table)
                 elif source.kind == 'docx_data':
                     document = read_docx(content, limits=self.limits)
@@ -182,6 +224,8 @@ class ContextBuilder:
                         'table_count': document.table_count, 'character_count': document.character_count,
                         'text': document.text,
                     }
+            except ContextInputError:
+                raise
             except Exception as exc:
                 raise ContextInputError(PauseReason.AMBIGUOUS_DATA,
                                         '已选 CSV、XLSX 或 DOCX 数据无法解析，请检查文件格式。') from exc

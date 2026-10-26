@@ -7,7 +7,7 @@ from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping, TemplateMappingError
 from tests.fixtures.docx.fixture_factory import DOCUMENT_XML, write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 class TemplateMappingTests(unittest.TestCase):

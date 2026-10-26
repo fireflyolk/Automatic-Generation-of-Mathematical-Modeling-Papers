@@ -8,9 +8,10 @@ from mathmodel_paper_studio.agents.preflight import Provider
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.domain.models import Project, Run, RunStatus, SourceFile, Stage
 from mathmodel_paper_studio.workflow.context_builder import ContextBuilder, ContextInputError
+from mathmodel_paper_studio.workflow.stages import ArtifactDigest
 from tests.fixtures.docx.fixture_factory import write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 
 
 class ContextBuilderTests(unittest.TestCase):
@@ -69,6 +70,17 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual({'csv1', 'template1', 'docxdata1'}, {item.source_id for item in paper.inputs})
         self.assertTrue(next(item for item in paper.inputs if item.source_id == 'template1').untrusted_data)
 
+    def test_paper_drafting_receives_the_approved_problem_decomposition(self):
+        decomposition = ArtifactDigest(
+            '90_runs/run1/stages/problem_decomposition/attempt-00-delivery-000001/decomposition.json',
+            'a' * 64, 'ev_123456789012345678901234', 'stage_output',
+            Stage.PROBLEM_DECOMPOSITION, 0, 1, 128,
+        )
+
+        paper = self.builder.build(Stage.PAPER_DRAFTING, upstream_artifacts=(decomposition,))
+
+        self.assertEqual((decomposition,), paper.upstream_artifacts)
+
     def test_docx_data_is_available_to_data_profile_stage_and_template_stays_separate(self):
         profile = self.builder.build(Stage.DATA_PROFILE)
 
@@ -78,6 +90,65 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn('摘要', docx_profile['text'])
         self.assertEqual(1, docx_profile['table_count'])
         self.assertNotIn('template1', {item.source_id for item in profile.inputs})
+
+    def test_xlsx_data_profile_reuses_the_imported_worksheet_selection(self):
+        from openpyxl import Workbook
+
+        first_path = self.project_root / '00_inputs/source-0001-v0001.xlsx'
+        workbook = Workbook()
+        workbook.active.title = '选中表'
+        workbook.active.append(('x', 'y'))
+        workbook.active.append((1, 2))
+        workbook.create_sheet('未选中表').append(('other', 'ignored'))
+        workbook.save(first_path)
+        workbook.close()
+        content = first_path.read_bytes()
+        analysis = self.project_root / '10_analysis'
+        analysis.mkdir()
+        for version, profile_suffix in (('0001', ''), ('0002', '-v0002')):
+            with self.subTest(version=version):
+                relative = f'00_inputs/source-0001-v{version}.xlsx'
+                xlsx_path = self.project_root / relative
+                xlsx_path.write_bytes(content)
+                (analysis / f'source-0001{profile_suffix}-profile.json').write_text(json.dumps({
+                    'sheet_name': '选中表', 'sheet_names': ['选中表', '未选中表'],
+                    'row_count': 1, 'columns': [],
+                }), encoding='utf-8')
+                xlsx_source = self._source(f'xlsx{version}', relative, 'xlsx', xlsx_path)
+                builder = ContextBuilder(
+                    self.project, self.run, self.project_root, self.sources + (xlsx_source,),
+                    selected_source_ids=(xlsx_source.source_id,),
+                )
+
+                context = builder.build(Stage.DATA_PROFILE)
+                profile = json.loads(context.inputs[0].profile_json)
+
+                self.assertEqual('选中表', profile['sheet_name'])
+                self.assertEqual(['选中表', '未选中表'], profile['sheet_names'])
+                self.assertEqual(1, profile['row_count'])
+                self.assertEqual('x', profile['columns'][0]['name'])
+                self.assertEqual({'min': 1.0, 'max': 1.0}, profile['columns'][0]['numeric_range'])
+
+    def test_multisheet_xlsx_without_imported_sheet_selection_fails_closed(self):
+        from openpyxl import Workbook
+
+        xlsx_path = self.project_root / '00_inputs/source-0001-v0001.xlsx'
+        workbook = Workbook()
+        workbook.active.title = '表一'
+        workbook.active.append(('x',))
+        workbook.create_sheet('表二').append(('y',))
+        workbook.save(xlsx_path)
+        workbook.close()
+        xlsx_source = self._source(
+            'xlsxmissing', '00_inputs/source-0001-v0001.xlsx', 'xlsx', xlsx_path,
+        )
+        builder = ContextBuilder(
+            self.project, self.run, self.project_root, self.sources + (xlsx_source,),
+            selected_source_ids=('xlsxmissing',),
+        )
+
+        with self.assertRaisesRegex(ContextInputError, '工作表选择记录'):
+            builder.build(Stage.DATA_PROFILE)
 
     def test_non_text_selection_and_duplicate_copy_paths_are_ambiguous(self):
         with self.assertRaises(ContextInputError):

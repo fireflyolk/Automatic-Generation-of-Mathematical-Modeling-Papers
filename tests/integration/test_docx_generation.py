@@ -4,12 +4,18 @@ from pathlib import Path
 
 from mathmodel_paper_studio.paper.docx_qa import run_docx_qa
 from mathmodel_paper_studio.paper.docx_writer import PaperDraft, FigureDraft, TableDraft, TextSection, write_paper
+from mathmodel_paper_studio.paper.standards import PaperStandard
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from tests.fixtures.docx.fixture_factory import DOCUMENT_XML, PNG_DATA, write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 EVIDENCE = 'ev_123456789012345678901234'
+# Isolates citation/rendering status from the default B078 body-length minimum.
+LENIENT_STANDARD = PaperStandard(
+    standard_id='test-qa-standard', version='1', display_name='测试 QA 规范',
+    target_pages=1, required_sections=('abstract',), optional_sections=(),
+    content_rules={}, style_defaults={}, stage_rules={})
 
 
 class DocxGenerationQaTests(unittest.TestCase):
@@ -36,8 +42,10 @@ class DocxGenerationQaTests(unittest.TestCase):
         )
         generated = write_paper(self.template, self.output, self.inspection, self.mapping, draft)
         report = run_docx_qa(generated.path, self.inspection, self.mapping,
+                              standard=LENIENT_STANDARD,
                               required_section_keys=('abstract',),
                               required_figure_keys=('results_figure',),
+                              standard_sections=('abstract',),
                               expected_evidence_ids=(EVIDENCE,))
 
         self.assertTrue(report.package_valid)

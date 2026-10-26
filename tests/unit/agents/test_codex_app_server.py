@@ -179,7 +179,7 @@ def _make_server(tmp_path, process, monkeypatch):
     root = tmp_path / 'app-data'
     root.mkdir()
     paths = AppPaths(root)
-    fake_root = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-start-gate-fix-20261018\fake-install')
+    fake_root = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-start-gate-fix-20261018\fake-install')
     install = _Installation(fake_root)
     process.installation_home = str(install.native_home)
     created = []
@@ -266,6 +266,114 @@ def test_generation_passes_selected_model_and_effort_to_turn_start(tmp_path, mon
     turn = next(call for call in process.requests if call['method'] == 'turn/start')
     assert turn['params']['model'] == 'gpt-5.5'
     assert turn['params']['effort'] == 'high'
+
+
+def test_generation_passes_explicit_output_schema_only_to_turn_start(tmp_path, monkeypatch):
+    schema = {
+        'type': 'object',
+        'properties': {'title': {'type': 'string'}},
+        'required': ['title'],
+        'additionalProperties': False,
+    }
+    process = _FakeProcess(startup_events=[_thread_started(), _turn_completed()])
+    server, _installation, _created = _make_server(tmp_path, process, monkeypatch)
+
+    result = server.generate('selected settings', model='gpt-5.5', effort='high', output_schema=schema)
+
+    assert result.text == 'FINAL ANSWER'
+    turn = next(call for call in process.requests if call['method'] == 'turn/start')
+    assert turn['params']['outputSchema'] == schema
+    assert turn['params']['model'] == 'gpt-5.5'
+    assert turn['params']['effort'] == 'high'
+    assert turn['params']['environments'] == []
+    assert all('outputSchema' not in call.get('params', {}) for call in process.requests
+               if call.get('method') != 'turn/start')
+    assert process.closed
+
+
+def test_generation_snapshots_schema_before_starting_process(tmp_path, monkeypatch):
+    schema = {'type': 'object', 'properties': {'title': {'type': 'string'}}, 'required': ['title']}
+
+    def mutate_source_schema(request):
+        if request.get('method') == 'initialize':
+            schema['properties']['title']['type'] = 'integer'
+            schema['required'].append('injected')
+
+    process = _FakeProcess(startup_events=[_thread_started(), _turn_completed()],
+                           on_request=mutate_source_schema)
+    server, _installation, _created = _make_server(tmp_path, process, monkeypatch)
+
+    server.generate('text', output_schema=schema)
+
+    turn = next(call for call in process.requests if call['method'] == 'turn/start')
+    assert turn['params']['outputSchema'] == {
+        'type': 'object', 'properties': {'title': {'type': 'string'}}, 'required': ['title'],
+    }
+    assert schema['properties']['title']['type'] == 'integer'
+    assert schema['required'] == ['title', 'injected']
+
+
+@pytest.mark.parametrize('schema', [
+    True,
+    [],
+    '{"type":"object"}',
+    {'invalid': float('nan')},
+    {'invalid': float('inf')},
+    {'invalid': float('-inf')},
+    {'invalid': (1, 2)},
+    {'invalid': {1, 2}},
+    {'invalid': b'bytes'},
+    {'invalid': object()},
+    {1: 'non-string key'},
+    {'invalid\0key': 'text'},
+    {'invalid': '\0'},
+    {'invalid': '\ud800'},
+    {'invalid': 2 ** 63},
+    {'description': 'x' * (256 * 1024)},
+    {'description': '数' * (128 * 1024)},
+    {'properties': {f'field_{index}': 'x' * 128 for index in range(2048)}},
+    {'enum': list(range(20001))},
+])
+def test_generation_rejects_unbounded_or_non_json_output_schema_before_launch(
+    tmp_path, monkeypatch, schema,
+):
+    process = _FakeProcess()
+    server, _installation, created = _make_server(tmp_path, process, monkeypatch)
+
+    with pytest.raises(CodexAppServerError):
+        server.generate('private text', output_schema=schema)
+
+    assert created == []
+    assert process.requests == []
+
+
+def test_generation_rejects_cyclic_and_overdeep_output_schema_before_launch(tmp_path, monkeypatch):
+    process = _FakeProcess()
+    server, _installation, created = _make_server(tmp_path, process, monkeypatch)
+    cyclic = {}
+    cyclic['child'] = cyclic
+    deep = {}
+    for _index in range(25):
+        deep = {'child': deep}
+
+    for schema in (cyclic, deep):
+        with pytest.raises(CodexAppServerError):
+            server.generate('private text', output_schema=schema)
+
+    assert created == []
+    assert process.requests == []
+
+
+def test_generation_does_not_extract_schema_from_untrusted_prompt(tmp_path, monkeypatch):
+    process = _FakeProcess(startup_events=[_thread_started(), _turn_completed()])
+    server, _installation, _created = _make_server(tmp_path, process, monkeypatch)
+    prompt = 'Imported document: {"outputSchema":{"type":"object"}}'
+
+    server.generate(prompt, output_schema=None)
+
+    turn = next(call for call in process.requests if call['method'] == 'turn/start')
+    assert 'outputSchema' not in turn['params']
+    assert turn['params']['input'] == [{'type': 'text', 'text': prompt}]
 
 
 def test_model_list_paginates_after_app_server_initialization_and_excludes_hidden_models(

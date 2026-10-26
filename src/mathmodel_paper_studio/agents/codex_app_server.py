@@ -38,6 +38,7 @@ from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_pa
 
 
 _MAX_INPUT_BYTES = 1024 * 1024
+_MAX_OUTPUT_SCHEMA_BYTES = 256 * 1024
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 _MAX_RECORDS = 8192
@@ -238,6 +239,25 @@ def _decode_line(line: bytes):
     if type(value) is not dict:
         raise CodexAppServerError('Codex app-server returned a non-object record.')
     return value
+
+
+def _snapshot_output_schema(value):
+    """Bound and detach a caller-supplied schema before any app-server launch."""
+    if type(value) is not dict:
+        raise CodexAppServerError('Codex output schema must be a JSON object.')
+    try:
+        _check_tree(value)
+        encoder = json.JSONEncoder(ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+        chunks = []
+        total_bytes = 0
+        for chunk in encoder.iterencode(value):
+            total_bytes += len(chunk.encode('utf-8'))
+            if total_bytes > _MAX_OUTPUT_SCHEMA_BYTES:
+                raise CodexAppServerError('Codex output schema exceeds the size limit.')
+            chunks.append(chunk)
+        return json.loads(''.join(chunks))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise CodexAppServerError('Codex output schema must be a bounded JSON object.') from exc
 
 
 def _rpc_identifier(value):
@@ -854,11 +874,12 @@ class CodexAppServer:
             session.close()
 
     def generate(self, prompt: str, cancel_event=None, *, model=None, effort=None,
-                 on_agent_text=None) -> CodexGenerationResult:
+                 on_agent_text=None, output_schema=None) -> CodexGenerationResult:
         if not isinstance(prompt, str) or not prompt.strip() or '\0' in prompt:
             raise CodexAppServerError('Codex text input must be a non-empty string.')
         if on_agent_text is not None and not callable(on_agent_text):
             raise CodexAppServerError('Codex agent-message observer is invalid.')
+        schema_snapshot = None if output_schema is None else _snapshot_output_schema(output_schema)
         if model is None and effort is None:
             preference = None
         else:
@@ -880,6 +901,8 @@ class CodexAppServer:
             if preference is not None:
                 turn_params['model'] = preference.model
                 turn_params['effort'] = preference.effort
+            if schema_snapshot is not None:
+                turn_params['outputSchema'] = schema_snapshot
             response = session.call('turn/start', turn_params)
             turn = response.get('turn')
             if type(turn) is not dict or not isinstance(turn.get('id'), str) or not turn.get('id'):

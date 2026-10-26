@@ -24,7 +24,7 @@ from mathmodel_paper_studio.agents.windows_job import NativeJobProcess, NativePr
 from mathmodel_paper_studio.bootstrap.paths import AppPaths, validate_managed_path
 from mathmodel_paper_studio.security.path_guard import executable_digest, native_executable
 
-DEFAULT_INSTALLATION_ROOT = Path(r'F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-live-cli-20261016')
+DEFAULT_INSTALLATION_ROOT = Path(r'F:\MathModelPaperStudio\downloads\mathmodel-paper-studio-live-cli-20261016')
 _PINS = {
     Provider.CODEX: ('0.159.3', '57e1bdab42c0559a74558ca17e85d5c7893caa5f1e582f67e9ddd6d97fa705a7'),
     Provider.CLAUDE: ('2.1.291', '70052a17e06561a4563597f79570e81ccc0772474c3c6ac522aa5ccc71773013'),

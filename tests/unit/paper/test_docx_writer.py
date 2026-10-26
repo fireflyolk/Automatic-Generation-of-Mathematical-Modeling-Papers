@@ -5,14 +5,17 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
+from docx import Document
+
 from mathmodel_paper_studio.paper.template_inspector import inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping
 from mathmodel_paper_studio.paper.docx_writer import (
-    FigureDraft, PaperDraft, TableDraft, TextSection, write_paper,
+    EquationDraft, FigureDraft, PaperDraft, SubsectionDraft, TableDraft, TextSection,
+    _math_paragraph, write_paper,
 )
 from tests.fixtures.docx.fixture_factory import DOCUMENT_XML, PNG_DATA, write_fixture
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 EVIDENCE = 'ev_123456789012345678901234'
 
 
@@ -78,12 +81,14 @@ class DocxWriterTests(unittest.TestCase):
             write_paper(self.template, self.output_dir, self.inspection, self.mapping, bad_draft)
         self.assertEqual(first_bytes, first.path.read_bytes())
 
-    def test_unevidenced_claim_is_marked_for_review_and_bad_image_is_rejected(self):
+    def test_unevidenced_claim_review_stays_out_of_body_and_bad_image_is_rejected(self):
         draft = PaperDraft(sections=(TextSection('abstract', ('结论需要复核。',)),))
         result = write_paper(self.template, self.output_dir, self.inspection, self.mapping, draft)
         with ZipFile(result.path) as archive:
             document = archive.read('word/document.xml').decode('utf-8')
-        self.assertIn('待人工核验', document)
+            audit = archive.read('customXml/mmps-paper-review.xml').decode('utf-8')
+        self.assertNotIn('待人工核验', document)
+        self.assertIn('内容尚未关联证据', audit)
         with self.assertRaises(ValueError):
             FigureDraft('results_figure', b'bad-image', 'png', 'x', (EVIDENCE,))
 
@@ -98,6 +103,77 @@ class DocxWriterTests(unittest.TestCase):
         with ZipFile(result.path) as archive:
             document = archive.read('word/document.xml').decode('utf-8')
         self.assertLess(document.index('>结果<'), document.index('figure-results_figure'))
+
+    def test_equation_is_inserted_under_its_declared_subsection(self):
+        draft = PaperDraft(
+            sections=(TextSection(
+                'abstract', ('章节引言。',), subsections=(
+                    SubsectionDraft('守恒方程', ('控制体推导。',)),
+                    SubsectionDraft('边界条件', ('边界说明。',)),
+                ),
+            ),),
+            equations=(EquationDraft(
+                'abstract', 'x=1', '守恒关系', subsection_index=1,
+            ),),
+        )
+
+        result = write_paper(self.template, self.output_dir, self.inspection, self.mapping, draft)
+        document = Document(result.path)
+        paragraphs = document.paragraphs
+        equation_index = next(
+            index for index, paragraph in enumerate(paragraphs)
+            if paragraph._p.xpath('.//m:oMath')
+        )
+        first_subsection_index = next(
+            index for index, paragraph in enumerate(paragraphs)
+            if paragraph.text.endswith('守恒方程')
+        )
+        second_subsection_index = next(
+            index for index, paragraph in enumerate(paragraphs)
+            if paragraph.text.endswith('边界条件')
+        )
+
+        self.assertGreater(equation_index, first_subsection_index)
+        self.assertLess(equation_index, second_subsection_index)
+
+    def test_equation_rejects_a_subsection_index_outside_its_parent(self):
+        section = TextSection(
+            'abstract', ('章节引言。',),
+            subsections=(SubsectionDraft('守恒方程', ('控制体推导。',)),),
+        )
+        equation = EquationDraft('abstract', 'x=1', '守恒关系', subsection_index=2)
+
+        with self.assertRaises(ValueError):
+            PaperDraft(sections=(section,), equations=(equation,))
+
+    def test_common_latex_fraction_and_math_commands_render_as_readable_editable_math(self):
+        paragraph, supported = _math_paragraph(
+            r'\frac{A_s(t)}{V(t)}=\frac{2}{R(t)}, \rho_d, \tag{11}'
+        )
+
+        math_text = ''.join(paragraph.itertext())
+        self.assertTrue(supported)
+        self.assertNotIn(r'\frac', math_text)
+        self.assertNotIn(r'\tag', math_text)
+        self.assertIn('(', math_text)
+        self.assertIn('/', math_text)
+        self.assertIn('ρ', math_text)
+        self.assertTrue(any(node.tag.endswith('}oMath') for node in paragraph.iter()))
+
+    def test_common_latex_integral_and_limits_do_not_leak_commands_into_equation_text(self):
+        paragraph, supported = _math_paragraph(
+            r'\int_0^{R(t)} \rho_d(r,t) \, dr, \mathcal{R}_n, '
+            r'\mathbb{Z}, t_{k+1}\le t'
+        )
+
+        math_text = ''.join(paragraph.itertext())
+        self.assertTrue(supported)
+        for command in (r'\int', r'\rho', r'\mathcal', r'\mathbb', r'\le'):
+            self.assertNotIn(command, math_text)
+        self.assertIn('∫', math_text)
+        self.assertIn('ℛ', math_text)
+        self.assertIn('ℤ', math_text)
+        self.assertIn('≤', math_text)
 
     def test_section_placeholder_search_stops_at_the_next_heading(self):
         moved = DOCUMENT_XML.replace(

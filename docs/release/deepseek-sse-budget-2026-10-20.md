@@ -2,7 +2,7 @@
 
 ## Confirmed failure
 
-Run `c81d0e4a3f384f75b001315360b7d002` paused in `problem_decomposition` with
+Run `[运行/项目 ID 已省略]` paused in `problem_decomposition` with
 `invalid_response`. A read-only replay of its confirmed inputs reproduced the
 failure with the real DeepSeek API using `deepseek-flash`, effort `max`, and
 16,384 maximum output tokens:
@@ -40,10 +40,10 @@ rejection, cancellation, and per-run authorization remain enforced.
 ## Desktop package
 
 Output:
-Output directory: [local path omitted].
+`[本机路径已省略]`
 
 SHA-256:
-SHA-256: [omitted].
+`[本地发布哈希已省略]`
 
 - Build exited 0 with computation runtime, package-file, and EXE-member audits.
 - The bundled parser bytecode references the new 16 MiB stream budget and retains
@@ -58,4 +58,4 @@ Protocol evidence is under the output task's `diagnostics` directory:
 `wire-probe.json`, `stage-wire-before.json`, and `stage-live-after.json`.
 These contain structural metadata and byte counts, with no API Key, prompt text,
 raw model answer, or reasoning text. Diagnostic scripts and build intermediates
-Diagnostic scripts and build intermediates remain under the task-local directory; exact path omitted.
+remain under `[本机路径已省略]`.

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\template-mapping')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-fluent-20261017\template-mapping')
 _CHILD_FLAG = 'MATHMODEL_TEMPLATE_MAPPING_CHILD'
 
 
@@ -192,7 +192,7 @@ if os.environ.get(_CHILD_FLAG) == '1':
             self.assertFalse(self.view.save_button.isEnabled())
             self.assertFalse(self.view.mapping_empty_label.isHidden())
             self.assertTrue(self.view.mapping_scroll_area.isHidden())
-            self.assertEqual('尚未选择模板', self.view.template_label.text())
+            self.assertIn('内置默认', self.view.template_label.text())
 
         def test_path_with_dotdot_escape_is_rejected_before_worker_start(self):
             pool = _DeferredPool()

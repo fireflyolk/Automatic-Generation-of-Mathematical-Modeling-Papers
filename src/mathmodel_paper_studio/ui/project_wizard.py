@@ -5,10 +5,10 @@ from PySide6.QtCore import QThreadPool, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QListWidget,
-    QScrollArea, QVBoxLayout, QWidget,
+    QListWidgetItem, QScrollArea, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CardWidget, CaptionLabel, FluentIcon, FluentSystemColor, LineEdit,
+    BodyLabel, CardWidget, CaptionLabel, ComboBox, FluentIcon, FluentSystemColor, LineEdit,
     PrimaryPushButton, ProgressBar, PushButton, Theme, qconfig, setCustomStyleSheet,
     TextEdit, TitleLabel,
 )
@@ -17,6 +17,7 @@ from mathmodel_paper_studio.bootstrap.paths import validate_import_source_path
 from mathmodel_paper_studio.inputs.docx_reader import read_docx
 from mathmodel_paper_studio.inputs.pdf_reader import read_pdf
 from mathmodel_paper_studio.inputs.profiling import ImportLimits, read_source_bounded
+from mathmodel_paper_studio.inputs.xlsx_reader import xlsx_sheet_names
 from mathmodel_paper_studio.projects.project_service import ProjectService
 from mathmodel_paper_studio.ui.workers import FunctionWorker
 
@@ -64,6 +65,8 @@ class ProjectWizard(QDialog):
         self._source_files = ()
         self._template_path = None
         self._problem_document = None
+        self._sheet_options = {}
+        self._sheet_selection = {}
         self._worker = None
         self._worker_signals = None
         self._retry_available = False
@@ -265,11 +268,50 @@ class ProjectWizard(QDialog):
             self._source_files = ()
             self._refresh_file_list()
             return
+        try:
+            self._refresh_sheet_options(candidates)
+        except (OSError, ValueError) as exc:
+            self._retry_available = False
+            self._set_error(f'无法读取 XLSX 工作表列表：{exc}')
+            self._source_files = ()
+            self._sheet_selection = {}
+            self._refresh_file_list()
+            return
         self._source_files = candidates
         self._retry_available = False
         self._input_error = None
         self._refresh_file_list()
         self._update_validity()
+
+    def _refresh_sheet_options(self, candidates):
+        """Cache worksheet names per file name; selection defaults to the first sheet."""
+        wanted = {item.name for item in candidates}
+        self._sheet_options = {key: names for key, names in self._sheet_options.items()
+                               if key in wanted}
+        self._sheet_selection = {key: name for key, name in self._sheet_selection.items()
+                                 if key in wanted}
+        for item in candidates:
+            key = item.name
+            if item.suffix.casefold() != '.xlsx':
+                self._sheet_selection.pop(key, None)
+                continue
+            if key not in self._sheet_options:
+                self._sheet_options[key] = xlsx_sheet_names(item, ImportLimits())
+            names = self._sheet_options[key]
+            if self._sheet_selection.get(key) not in names:
+                self._sheet_selection[key] = names[0]
+
+    def set_sheet_selection(self, source, sheet_name) -> None:
+        key = Path(source).name
+        names = self._sheet_options.get(key, ())
+        if sheet_name not in names:
+            raise ValueError('工作表选择无效。')
+        self._sheet_selection[key] = sheet_name
+        self._refresh_file_list()
+
+    @property
+    def sheet_selection(self) -> dict[str, str]:
+        return dict(self._sheet_selection)
 
     def set_problem_docx(self, path) -> None:
         self.set_problem_document(path)
@@ -349,7 +391,7 @@ class ProjectWizard(QDialog):
         if value == 'template':
             self.set_template_path(None)
         else:
-            self.set_source_files(tuple(item for item in self._source_files if str(item) != value))
+            self.set_source_files(tuple(item for item in self._source_files if item.name != value))
 
     def _update_remove_enabled(self):
         self.remove_source_button.setEnabled(
@@ -358,9 +400,34 @@ class ProjectWizard(QDialog):
     def _refresh_file_list(self):
         self.file_list.clear()
         for source in self._source_files:
+            key = source.name
+            names = self._sheet_options.get(key, ())
             label = 'DOCX 数据' if source.suffix.casefold() == '.docx' else '数据'
-            self.file_list.addItem(f'{label}：{source}')
-            self.file_list.item(self.file_list.count() - 1).setData(256, str(source))
+            row = QWidget(self.file_list)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 2, 8, 2)
+            row_layout.setSpacing(8)
+            caption = BodyLabel(f'{label}：{source}', row)
+            caption.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+            row_layout.addWidget(caption, 0, Qt.AlignmentFlag.AlignLeft)
+            if len(names) > 1:
+                hint = CaptionLabel('工作表', row)
+                row_layout.addWidget(hint, 0, Qt.AlignmentFlag.AlignLeft)
+                combo = ComboBox(row)
+                combo.addItems(names)
+                current = self._sheet_selection.get(key, names[0])
+                combo.setCurrentIndex(max(0, names.index(current)))
+                combo.currentIndexChanged.connect(
+                    lambda _index, target=key, box=combo: self.set_sheet_selection(target, box.currentText()))
+                combo.setAccessibleName(f'{source.name} 的工作表选择')
+                combo.setFixedWidth(180)
+                row_layout.addWidget(combo, 0, Qt.AlignmentFlag.AlignLeft)
+            row_layout.addStretch(1)
+            entry = QListWidgetItem()
+            entry.setData(256, key)
+            entry.setSizeHint(row.sizeHint())
+            self.file_list.addItem(entry)
+            self.file_list.setItemWidget(entry, row)
         if self._template_path is not None:
             self.file_list.addItem(f'Word 模板：{self._template_path}')
             self.file_list.item(self.file_list.count() - 1).setData(256, 'template')
@@ -442,6 +509,7 @@ class ProjectWizard(QDialog):
         self.import_progress.show()
         self._worker = FunctionWorker(
             lambda cancel, emit: self.service.create(title, problem, sources, template=template,
+                                                    sheets=dict(self._sheet_selection) or None,
                                                     problem_document=problem_document))
         self._worker_signals = self._worker.signals
         self._worker_signals.event_received.connect(self._import_event)

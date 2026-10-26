@@ -13,6 +13,8 @@ from mathmodel_paper_studio.domain.models import RunStatus
 from mathmodel_paper_studio.domain.models import StageStatus
 from mathmodel_paper_studio.ui.workers import FunctionWorker
 from mathmodel_paper_studio.ui.run_timeline import RunTimelineWidget
+from mathmodel_paper_studio.ui.run_observer import RunObserverDialog
+from mathmodel_paper_studio.ui.paper_preview import PaperPreviewDialog
 from mathmodel_paper_studio.workflow.progress import RunProgressReporter
 from mathmodel_paper_studio.workflow.stages import PauseReason, WORKFLOW_STAGES
 
@@ -32,6 +34,16 @@ _STAGE_STATUS_TEXT = {
     StageStatus.PAUSED: '已暂停', StageStatus.COMPLETED: '已完成',
     StageStatus.FAILED: '失败', StageStatus.CANCELLED: '已取消',
 }
+
+
+def _status_detail(state):
+    """Return a diagnostic only when it describes the current terminal error."""
+    if state.status not in (RunStatus.PAUSED, RunStatus.FAILED):
+        return ''
+    detail = state.diagnostics[-1] if state.diagnostics else ''
+    if state.status is RunStatus.PAUSED and state.pause_reason is not None:
+        detail = detail or f'暂停原因：{state.pause_reason.value}'
+    return detail
 
 
 class RunPanel(QWidget):
@@ -105,7 +117,13 @@ class RunPanel(QWidget):
 
         stages_card = CardWidget(content)
         stages_layout = QVBoxLayout(stages_card)
-        stages_layout.addWidget(TitleLabel('阶段记录', stages_card))
+        stages_header = QHBoxLayout()
+        stages_header.addWidget(TitleLabel('阶段记录', stages_card), 1)
+        self.open_paper_preview_button = PushButton('实时论文预览', stages_card)
+        self.open_paper_preview_button.setObjectName('openLivePaperPreview')
+        self.open_paper_preview_button.setAccessibleName('打开实时论文 Word 预览窗口')
+        stages_header.addWidget(self.open_paper_preview_button)
+        stages_layout.addLayout(stages_header)
         self.stage_list = QListWidget()
         self.stage_list.setObjectName('runStageList')
         self.stage_list.setAccessibleName('运行阶段记录')
@@ -115,7 +133,13 @@ class RunPanel(QWidget):
 
         events_card = CardWidget(content)
         events_layout = QVBoxLayout(events_card)
-        events_layout.addWidget(TitleLabel('运行事件', events_card))
+        events_header = QHBoxLayout()
+        events_header.addWidget(TitleLabel('运行事件', events_card), 1)
+        self.open_observer_button = PushButton('打开观察窗口', events_card)
+        self.open_observer_button.setObjectName('openRunObserver')
+        self.open_observer_button.setAccessibleName('打开 Agent 实时正文观察窗口')
+        events_header.addWidget(self.open_observer_button)
+        events_layout.addLayout(events_header)
         self.event_view = QPlainTextEdit()
         self.event_view.setObjectName('runEventView')
         self.event_view.setAccessibleName('运行事件和诊断')
@@ -149,6 +173,12 @@ class RunPanel(QWidget):
         layout.addLayout(timeline_actions)
         layout.addWidget(self.progress_splitter, 1)
         self.progress_event_received.connect(self.run_timeline.append_event)
+        self.run_observer = RunObserverDialog(self)
+        self.paper_preview = PaperPreviewDialog(self)
+        self.progress_event_received.connect(self.run_observer.append_event)
+        self.progress_event_received.connect(self.paper_preview.append_event)
+        self.open_observer_button.clicked.connect(self._open_observer)
+        self.open_paper_preview_button.clicked.connect(self._open_paper_preview)
         self.timeline_toggle_button.clicked.connect(self._toggle_timeline)
 
         artifact_row = QHBoxLayout()
@@ -187,10 +217,25 @@ class RunPanel(QWidget):
             return self._progress_reporter
         self.set_run_id(run_id)
         self.run_timeline.reset_for_run(run_id)
+        self.run_observer.reset_for_run(run_id)
+        self.paper_preview.reset_for_run(run_id)
         self._progress_reporter = RunProgressReporter(
             run_id, self.progress_event_received.emit,
         )
         return self._progress_reporter
+
+    def _open_observer(self):
+        self.run_observer.show()
+        self.run_observer.raise_()
+        self.run_observer.activateWindow()
+
+    def _open_paper_preview(self):
+        self.paper_preview.open_preview()
+
+    def closeEvent(self, event):
+        self.run_observer.close()
+        self.paper_preview.close()
+        super().closeEvent(event)
 
     def _set_timeline_visible(self, visible):
         visible = bool(visible)
@@ -293,9 +338,7 @@ class RunPanel(QWidget):
         if state.next_stage is not None:
             stage = _STAGE_TEXT.get(state.next_stage.value, state.next_stage.value)
             self.stage_list.addItem(f'下一阶段：{stage}')
-        detail = state.diagnostics[-1] if state.diagnostics else ''
-        if state.pause_reason is not None:
-            detail = detail or f'暂停原因：{state.pause_reason.value}'
+        detail = _status_detail(state)
         self.set_run_state(state.status, _STATUS_TEXT[state.status] + (f'：{detail}' if detail else ''))
         if state.status is RunStatus.PAUSED and state.pause_reason is PauseReason.ADAPTER_UNAVAILABLE:
             self._resume_blocked_reason = (

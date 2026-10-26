@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-run-sidebar\ui-accessibility')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-run-sidebar\ui-accessibility')
 _CHILD_FLAG = 'MATHMODEL_FLUENT_ACCESSIBILITY_CHILD'
 
 

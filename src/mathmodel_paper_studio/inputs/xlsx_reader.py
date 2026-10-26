@@ -10,7 +10,9 @@ from defusedxml.common import DefusedXmlException
 from openpyxl import load_workbook
 from openpyxl.utils.cell import range_boundaries, coordinate_to_tuple
 
-from mathmodel_paper_studio.inputs.profiling import ImportLimits, checked_table, read_bounded
+from mathmodel_paper_studio.inputs.profiling import (
+    ImportLimits, checked_table, read_bounded, read_source_bounded,
+)
 
 _NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 _RID = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
@@ -166,6 +168,17 @@ def _sheet_paths(roots: dict) -> dict[str, str]:
             raise ValueError('XLSX 工作表引用无效。')
         paths[sheet.attrib['name']] = path
     return paths
+
+
+def xlsx_sheet_names(path: Path | bytes, limits: ImportLimits = ImportLimits()) -> tuple[str, ...]:
+    """Inspect an imported XLSX source read-only, before it is copied to app storage."""
+    content = read_source_bounded(path, limits) if isinstance(path, Path) else read_bounded(path, limits)
+    try:
+        return tuple(_sheet_paths(_inspect(content, limits)))
+    except ValueError:
+        raise
+    except (BadZipFile, DefusedXmlException, OSError, KeyError, TypeError, OverflowError, SyntaxError, EOFError, RuntimeError) as exc:
+        raise ValueError('XLSX 文件无效、XML 不安全或结构不受支持。') from exc
 
 
 def read_xlsx(path: Path | bytes, *, sheet: str | None = None, limits: ImportLimits = ImportLimits()):

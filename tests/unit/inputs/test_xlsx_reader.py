@@ -1,10 +1,11 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
-from mathmodel_paper_studio.inputs.xlsx_reader import read_xlsx
+from mathmodel_paper_studio.inputs.xlsx_reader import read_xlsx, xlsx_sheet_names
 from mathmodel_paper_studio.inputs.profiling import ImportLimits, profile_table
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 class XlsxTests(unittest.TestCase):
     def setUp(self):
         from openpyxl import Workbook
@@ -38,6 +39,24 @@ class XlsxTests(unittest.TestCase):
         self.assertEqual('=2+2',table.rows[1][1])
         self.assertEqual(before,self.path.read_bytes())
         self.assertEqual(profile_table(table),profile_table(read_xlsx(self.path,sheet='数据')))
+    def test_sheet_names_use_the_same_safety_preflight(self):
+        self.assertEqual(('数据', '其他'), xlsx_sheet_names(self.path))
+        self.assertEqual(('数据', '其他'), xlsx_sheet_names(self.path.read_bytes()))
+        with self.assertRaises(ValueError):
+            xlsx_sheet_names(self.path, ImportLimits(max_file_bytes=1))
+        self.path.write_bytes(b'not zip')
+        with self.assertRaises(ValueError):
+            xlsx_sheet_names(self.path)
+
+    def test_sheet_names_allow_read_only_sources_on_other_local_drives(self):
+        source = Path(r'C:\Users\example\Downloads\data.xlsx')
+        content = self.path.read_bytes()
+        with patch('mathmodel_paper_studio.inputs.xlsx_reader.read_source_bounded',
+                   return_value=content) as read_source, \
+                patch('mathmodel_paper_studio.inputs.xlsx_reader.read_bounded',
+                      side_effect=AssertionError('managed storage reader used for source file')):
+            self.assertEqual(('数据', '其他'), xlsx_sheet_names(source))
+        read_source.assert_called_once_with(source, ImportLimits())
     def test_zip_and_parse_limits(self):
         for limit in (ImportLimits(max_file_bytes=1),ImportLimits(max_zip_member_bytes=1),
                       ImportLimits(max_zip_total_bytes=1),ImportLimits(max_rows=1),

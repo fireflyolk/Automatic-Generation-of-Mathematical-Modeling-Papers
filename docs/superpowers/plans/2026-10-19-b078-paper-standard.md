@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Project, temporary, cache, and generated outputs stay under the designated project workspace.
-Reference material: B078.pdf (read-only; not distributed with the repository).
+- 项目、临时文件、缓存和生成输出均位于 `[本机路径已省略]`。
+- `[本机路径已省略]` 只读；不复制原文、图表、数据、数值或水印。
 - B078 风格是无用户模板时的默认 DOCX 样式；用户导入的 DOCX 仍可选，源模板只读。
 - 约 30 页是内容规划参考，不是最低页数要求；禁止重复内容、空白页和虚构实验。
 - Codex 与 DeepSeek 使用同一规范档案和相同阶段要求；供应商适配器不承载论文标准。
@@ -29,7 +29,7 @@ Reference material: B078.pdf (read-only; not distributed with the repository).
 - Modify `src/mathmodel_paper_studio/paper/docx_writer.py`: render the built-in B078 style and structured paper front matter/equations; continue to fill custom DOCX templates without rewriting them.
 - Modify `src/mathmodel_paper_studio/paper/docx_qa.py`: report standard coverage and quality warnings separately from hard package/mapping/evidence errors.
 - Modify `src/mathmodel_paper_studio/ui/template_mapping_view.py`, `src/mathmodel_paper_studio/ui/main_window.py`, and if needed `src/mathmodel_paper_studio/ui/run_review.py`: expose B078 default versus imported DOCX and show standard/version plus warnings.
-- Build outputs use a task-specific folder under the project root; cache and temporary roots remain task-scoped.
+- Build outputs go to a new task-specific folder under `[本机路径已省略]`; build/cache/temp roots remain under `[本机路径已省略]`.
 
 ## Review Focus
 
@@ -128,7 +128,7 @@ Reference material: B078.pdf (read-only; not distributed with the repository).
 - No source changes unless build findings identify a required packaging inclusion.
 - Create acceptance notes only under the existing `docs/release/` structure if an output artifact is produced.
 
-**Produces:** Portable app directory and executable under the project root, with task-scoped build, temporary, and cache paths.
+**Produces:** New portable app directory and executable under `[本机路径已省略]`, with build/temp/cache paths under the corresponding F: `tmp` task directory.
 
 - [x] Choose a fresh output directory and validate every build/runtime/temp path is on F: before invoking `scripts/build_windows.ps1`.
 - [x] Build using the existing locked dependencies; run the packaged startup check and package/archive path audit, without invoking pytest.

@@ -12,12 +12,12 @@
 
 ## 构建产物
 
-- EXE：`F:\Codex另一个工作的地方\downloads\mathmodel-paper-studio-sandbox-20261019-reviewfix\release\MathModelPaperStudio\MathModelPaperStudio.exe`
-- SHA-256：`71AFDD8CFFD1D07AEC46B1EC38929F91FCD69CD85CCB7678D459020E334217EC`
+- EXE：`[本机路径已省略]`
+- SHA-256：`[本地发布哈希已省略]`
 - 包目录：7,886 个文件，433,454,319 字节；内置运行时：7,565 个文件、20 个锁定依赖；EXE 归档：798 个成员。
 - 构建依赖锁检查、运行时清单/锁检查、包路径与敏感内容扫描、EXE 归档审计均通过。
 - 审计报告：同一 `release` 目录中的 `computation-runtime-files.json`、`package-files.json` 和 `archive-members.json`。
-- 冻结启动报告：`F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-sandbox-20261019-reviewfix\packaged-startup-report.json`。结果为 `status=ok`、`frozen=true`、Python 3.13.14；应用数据库、缓存、项目与临时路径全部位于 F:。
+- 冻结启动报告：`[本机路径已省略]`。结果为 `status=ok`、`frozen=true`、Python 3.13.14；应用数据库、缓存、项目与临时路径全部位于 F:。
 
 ## 验收结果
 
@@ -26,8 +26,8 @@
 - 执行、工作流、计算产物、MVP E2E 与 Sandbox 集成组合：112 passed，38 个子测试通过。
 - 构建后使用新包内的计算运行时运行真实 Windows Sandbox 集成用例：1 passed，34.98 秒。
 - Sandbox 生成的 CSV 与 PNG：
-  - `F:\Codex另一个工作的地方\tmp\windows-sandbox-live-53799d1f706f\app\projects\sandbox47bf9c18\90_runs\run47bf9c18\40_results\calc-result.csv`
-  - `F:\Codex另一个工作的地方\tmp\windows-sandbox-live-53799d1f706f\app\projects\sandbox47bf9c18\90_runs\run47bf9c18\50_figures\calc-plot.png`
+  - `[本机路径已省略]`
+  - `[本机路径已省略]`
 - 结果记录：`execution-v0001.json` 显示 `stage_status=completed`、`execution_started=true`、`exit_code=0`、解释器 `sandbox:python.exe`；`validation-v0001.json` 中 CSV 与 PNG 均结构校验通过。
 - 合成回归结果：斜率 2.0、截距 1.0；输入写入被只读映射阻止，宿主哨兵路径不可见，外网连接失败。依赖导入成功：NumPy 2.5.4、pandas 3.0.6、SciPy 1.18.1、Matplotlib 3.11.2、python-docx 1.2.0、openpyxl 3.1.5、pypdf 6.21.1。
 - 最新增量只读代码复核未发现新的可操作问题。

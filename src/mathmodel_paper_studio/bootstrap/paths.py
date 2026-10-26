@@ -5,7 +5,7 @@ from pathlib import Path, PureWindowsPath
 import re
 import stat
 
-APPROVED_BASE = r'F:\Codex另一个工作的地方'
+APPROVED_BASE = r'F:\MathModelPaperStudio'
 DEFAULT_ROOT = APPROVED_BASE + r'\mathmodel-paper-studio-data'
 _RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', re.I)
 

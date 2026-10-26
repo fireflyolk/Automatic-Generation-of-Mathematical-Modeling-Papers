@@ -12,7 +12,7 @@ from mathmodel_paper_studio.agents.preflight import (
 from mathmodel_paper_studio.bootstrap.paths import AppPaths
 from mathmodel_paper_studio.ui.settings_view import SettingsView
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\task5-tests')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-fluent-20261017\task5-tests')
 APP = None
 
 

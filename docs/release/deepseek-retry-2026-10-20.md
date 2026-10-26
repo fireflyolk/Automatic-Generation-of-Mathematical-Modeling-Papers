@@ -15,7 +15,7 @@
 
 ## Evidence and limits
 
-The paused run `d31b977b41aa41b08cd8855c70f8edd2` stopped at `model_proposal`
+The paused run `[运行/项目 ID 已省略]` stopped at `model_proposal`
 with the safe diagnostic `incomplete_response`. Its saved checkpoint does not
 contain the provider's exact `finish_reason`, so the original response cannot
 be classified as `length`, `content_filter`, or another non-`stop` reason.
@@ -39,4 +39,4 @@ No DeepSeek API request was made during this update.
 
 Package:
 
-Package artifacts: [local paths omitted].
+`[本机路径已省略]`

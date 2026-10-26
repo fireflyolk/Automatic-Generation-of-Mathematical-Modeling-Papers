@@ -16,7 +16,7 @@ from mathmodel_paper_studio.domain.models import Stage
 from mathmodel_paper_studio.security.scope_manifest import EXTERNAL_PROCESSING_NOTICE
 from mathmodel_paper_studio.ui.run_review import RunReviewDialog, RunReviewModel
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-fluent-20261017\task5-tests')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-fluent-20261017\task5-tests')
 APP = None
 
 

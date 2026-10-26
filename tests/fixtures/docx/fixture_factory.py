@@ -42,8 +42,58 @@ def write_fixture(path: Path, *, document_xml: str | bytes | None = None, extra_
 
 
 def unsupported_text_box() -> str:
-    return DOCUMENT_XML.replace('</w:body>', '<w:p><w:r><w:drawing><wp:inline><w:txbxContent><w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wp:inline></w:drawing></w:r></w:p></w:body>')
+    return DOCUMENT_XML.replace(
+        '</w:body>',
+        '<w:p><w:r><w:drawing><wp:inline><w:txbxContent><w:p><w:r><w:t>box</w:t></w:r></w:p>'
+        '</w:txbxContent></wp:inline></w:drawing></w:r></w:p></w:body>')
 
 
 def unsupported_object() -> str:
     return DOCUMENT_XML.replace('</w:body>', '<w:p><w:r><w:object/></w:r></w:p></w:body>')
+
+
+def _heading(anchor: str, label: str, bookmark_id: int) -> str:
+    return (f'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            f'<w:bookmarkStart w:id="{bookmark_id}" w:name="{anchor}"/><w:r><w:t>{label}</w:t></w:r>'
+            f'<w:bookmarkEnd w:id="{bookmark_id}"/></w:p>')
+
+
+def standard_document_xml() -> str:
+    """Template body with one confirmed heading per B078 required paper section."""
+    sections = (
+        ('abstract', '摘要'), ('problem_restatement', '问题重述'), ('problem_analysis', '问题分析'),
+        ('assumptions', '模型假设'), ('notation', '符号说明'), ('model', '模型建立'),
+        ('solution', '模型求解'), ('results', '结果'), ('results_figure', '结果图'),
+        ('verification', '结果检验'), ('conclusion', '结论'), ('references', '参考文献'),
+    )
+    headings = ''.join(_heading(f'{key}_anchor', label, index)
+                       for index, (key, label) in enumerate(sections))
+    image = ('<w:p><w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>'
+             '<wp:docPr id="1" name="existing-image"/><a:graphic>'
+             '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+             '<pic:pic><pic:blipFill><a:blip r:embed="rIdTemplateImage"/></pic:blipFill></pic:pic>'
+             '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>')
+    table = ('<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblCaption w:val="result_anchor"/></w:tblPr>'
+             '<w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4000"/></w:tblGrid>'
+             '<w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:p><w:r><w:t>指标</w:t></w:r></w:p></w:tc>'
+             '<w:tc><w:p><w:r><w:t>数值</w:t></w:r></w:p></w:tc></w:tr>'
+             '<w:tr><w:tc><w:p><w:r><w:t>{{table:results}}</w:t></w:r></w:p></w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl>')
+    sect = ('<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" '
+            'w:header="720" w:footer="720"/></w:sectPr>')
+    return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document '
+            f'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            f'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            f'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+            f'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            f'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" '
+            f'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
+            f'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14">'
+            f'<w:body>{headings}{image}{table}{sect}</w:body></w:document>')
+
+
+def write_standard_fixture(path: Path, *, document_xml: str | bytes | None = None,
+                           extra_parts=None) -> Path:
+    """Write a template covering every required B078 paper section anchor."""
+    body = document_xml if document_xml is not None else standard_document_xml()
+    return write_fixture(path, document_xml=body, extra_parts=extra_parts)

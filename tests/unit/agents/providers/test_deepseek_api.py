@@ -761,7 +761,7 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertEqual(EventKind.FAILED, invalid_events[-1].kind)
         self.assertNotIn(API_KEY, repr(invalid_events))
 
-    def test_deepseek_progress_redacts_prompt_echo_and_waits_only_after_send(self):
+    def test_deepseek_progress_keeps_prompt_echo_and_waits_only_after_send(self):
         connection = FakeConnection(FakeResponse(chat_response('prompt')))
         client, _ = self.make_client(connection)
         events = []
@@ -775,8 +775,8 @@ class DeepSeekRequestTests(unittest.TestCase):
         client.generate_with_progress(make_context(), 'prompt', event_callback=sink)
 
         visible = ''.join(event.text for event in events if event.kind is EventKind.TEXT)
-        self.assertNotEqual('prompt', visible)
-        self.assertIn('[已隐藏]', visible)
+        self.assertEqual('prompt', visible)
+        self.assertNotIn('[已隐藏]', visible)
         self.assertEqual([True], sent_at_wait)
         self.assertEqual(EventKind.COMPLETED, events[-1].kind)
 

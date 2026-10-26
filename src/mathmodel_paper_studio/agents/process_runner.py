@@ -85,7 +85,6 @@ class _Redactor:
         hidden = {part for value in (prompt, *secrets) for part in (value, *value.splitlines()) if part}
         self.hidden = tuple(sorted(hidden, key=len, reverse=True))
         self.continuation = {}
-        self.literal_suffix = {}
         self.candidates = {}
         markers = ('sk-', 'sk_', 'ghp-', 'ghp_', 'github_pat-', 'github_pat_',
                    'AKIA-', 'AKIA_', 'Bearer ', 'token=', 'token:',
@@ -96,20 +95,15 @@ class _Redactor:
             raise ValueError('invalid candidate bound')
         self.candidate_bound = candidate_bound
         self.fixed_prefix_bound = max(map(len, self.prefixes))
+        # A known prompt or credential can be longer than the generic marker
+        # carry bound. Matching its own prefix is still bounded by the
+        # validated literal size (prompts and provider keys have input limits).
+        self.literal_candidate_bound = min(max(map(len, self.hidden), default=0), 1024 * 1024) + self.fixed_prefix_bound
         self.partial_marker = re.compile(r'(?i)\b(?:token|password|api[_-]?key)\s*$')
         self.pattern = re.compile(r'(?i)(?:\b(?:sk|ghp|github_pat|AKIA)[-_][A-Za-z0-9_-]*|\b(?:bearer\s+)[A-Za-z0-9._-]*|\b(?:token|password|api[_-]?key)\s*[:=]\s*[^\s,;]*|[A-Z]:[\\/][^\s"<>|]*|\\\\[^\s"<>|]+)')
 
     def clean(self, value, channel='events', *, final=False):
         value = self.candidates.pop(channel, '') + value
-        remaining = self.literal_suffix.pop(channel, '')
-        if remaining:
-            count = 0
-            while count < min(len(value), len(remaining)) and value[count] == remaining[count]:
-                count += 1
-            if count:
-                value = '[已隐藏]' + value[count:]
-                if count < len(remaining):
-                    self.literal_suffix[channel] = remaining[count:]
         continuation = self.continuation.pop(channel, None)
         if continuation:
             body, awaiting_value = continuation
@@ -120,14 +114,8 @@ class _Redactor:
             value = '[已隐藏]' + value[count:]
         for hidden in self.hidden:
             value = value.replace(hidden, '[已隐藏]')
-        # Mask a known-secret prefix immediately and remember only its suffix.
-        for hidden in self.hidden:
-            maximum = min(len(value), len(hidden) - 1)
-            count = next((n for n in range(maximum, 0, -1) if value.endswith(hidden[:n])), 0)
-            if count:
-                self.literal_suffix[channel] = hidden[count:]
-                value = value[:-count] + '[已隐藏]'
-                break
+        # Delay a possible trailing literal prefix until another chunk confirms
+        # the full secret; mismatches then release the original safe text.
         value = self._redact_pattern(value, channel)
         return value if final else self._carry_candidate(value, channel)
 
@@ -151,20 +139,44 @@ class _Redactor:
     def _carry_candidate(self, value, channel):
         partial = self.partial_marker.search(value)
         keep = max(0, partial.start() - 1) if partial else None
-        if keep is None:
-            for count in range(min(len(value), self.fixed_prefix_bound), 0, -1):
-                if value[-count:].casefold() in self.prefixes:
-                    keep = max(0, len(value) - count - 1)
-                    break
+        for count in range(min(len(value), self.fixed_prefix_bound), 0, -1):
+            if value[-count:].casefold() in self.prefixes:
+                candidate_start = max(0, len(value) - count - 1)
+                keep = candidate_start if keep is None else min(keep, candidate_start)
+                break
+        for hidden in self.hidden:
+            maximum = min(len(value), len(hidden) - 1)
+            count = next((n for n in range(maximum, 0, -1) if value.endswith(hidden[:n])), 0)
+            if count:
+                candidate_start = len(value) - count
+                keep = candidate_start if keep is None else min(keep, candidate_start)
         if keep is not None:
             candidate = value[keep:]
-            if len(candidate) > self.candidate_bound:
+            if len(candidate) > max(self.candidate_bound, self.literal_candidate_bound):
                 # Fail closed instead of retaining unbounded whitespace or
                 # releasing a possible sensitive label before its separator.
                 raise ValueError('redaction candidate exceeds bound')
             self.candidates[channel] = candidate
             value = value[:keep]
         return value
+
+
+def _utf8_chunks(value, byte_limit):
+    """Split sanitized text without breaking Unicode characters or event bounds."""
+    if not value:
+        return ()
+    chunks = []
+    start = size = 0
+    for index, character in enumerate(value):
+        character_size = len(character.encode('utf-8'))
+        if character_size > byte_limit:
+            raise ValueError('event byte limit is too small for text encoding')
+        if size and size + character_size > byte_limit:
+            chunks.append(value[start:index])
+            start, size = index, 0
+        size += character_size
+    chunks.append(value[start:])
+    return tuple(chunks)
 
 
 class _Output:
@@ -381,17 +393,38 @@ class ProcessRunner:
                 raise ValueError('event limit')
             terminal = event.kind in TERMINAL_KINDS
             sanitized = redactor.clean(event.text, final=terminal)
-            if terminal and not event.text and sanitized:
-                # Flush safe withheld text to its text stream rather than
-                # silently moving it into an empty terminal status message.
-                state['events'] += 1
-                if state['events'] > self.limits.max_events:
-                    raise ValueError('event limit')
-                yield AgentEvent(event.run_id, EventKind.TEXT, sanitized)
-                sanitized = ''
-            event = replace(event, text=sanitized)
             if terminal:
+                if sanitized and (not event.text or len(sanitized.encode('utf-8')) > self.limits.event_bytes):
+                    # Flush withheld text in bounded TEXT events rather than
+                    # exceeding AgentEvent's protocol limit on a terminal event.
+                    chunks = _utf8_chunks(sanitized, self.limits.event_bytes)
+                    state['events'] += len(chunks)
+                    if state['events'] > self.limits.max_events:
+                        raise ValueError('event limit')
+                    for chunk in chunks:
+                        yield AgentEvent(event.run_id, EventKind.TEXT, chunk)
+                    sanitized = ''
+                event = replace(event, text=sanitized)
                 state['terminal'] = event
             else:
-                yield event
+                chunks = _utf8_chunks(sanitized, self.limits.event_bytes)
+                if len(chunks) > 1:
+                    if event.kind is EventKind.TEXT:
+                        state['events'] += len(chunks) - 1
+                        status_event = None
+                    else:
+                        # A body flush must not duplicate tool/status events.
+                        state['events'] += len(chunks)
+                        status_event = replace(event, text='')
+                    if state['events'] > self.limits.max_events:
+                        raise ValueError('event limit')
+                    for chunk in chunks:
+                        if status_event is None:
+                            yield replace(event, text=chunk)
+                        else:
+                            yield AgentEvent(event.run_id, EventKind.TEXT, chunk, event.item_id)
+                    if status_event is not None:
+                        yield status_event
+                else:
+                    yield replace(event, text=sanitized)
 

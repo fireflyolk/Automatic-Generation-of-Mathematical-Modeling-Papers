@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from mathmodel_paper_studio.inputs.csv_reader import read_csv
 from mathmodel_paper_studio.inputs.profiling import ImportLimits, profile_table
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-20261015')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-20261015')
 class CsvTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT)

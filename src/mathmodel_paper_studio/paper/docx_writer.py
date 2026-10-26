@@ -19,9 +19,15 @@ from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
 from mathmodel_paper_studio.bootstrap.paths import validate_managed_path
+from mathmodel_paper_studio.paper.limits import MAX_PAPER_EQUATIONS
+from mathmodel_paper_studio.paper.quality import problem_coverage_evidence
+from mathmodel_paper_studio.paper.review_metadata import (
+    PaperReviewMetadata, REVIEW_PART, REVIEW_RELATIONSHIP, REVIEW_TARGET, encode_review_metadata,
+)
 from mathmodel_paper_studio.paper.standards import get_default_paper_standard
 from mathmodel_paper_studio.paper.template_inspector import TemplateInspection, inspect_template
 from mathmodel_paper_studio.paper.template_mapping import TemplateMapping, TemplateMappingError
+from mathmodel_paper_studio.paper.workflow_notes import publication_text, workflow_note_fragments
 
 _W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _M = '{http://schemas.openxmlformats.org/officeDocument/2006/math}'
@@ -38,7 +44,6 @@ _MAX_IMAGE_BYTES = 16 * 1024 * 1024
 _MAX_TABLE_ROWS = 10000
 _MAX_TEXT_CHARS = 100000
 _EVIDENCE_ID = re.compile(r'^[a-z][a-z0-9_-]{2,63}$')
-
 for _prefix, _uri in (
     ('w', _W[1:-1]), ('r', _R[1:-1]),
     ('wp', _WP[1:-1]), ('a', _A[1:-1]), ('pic', _PIC[1:-1]),
@@ -80,6 +85,15 @@ def _evidence_ids(values) -> tuple[str, ...]:
     if len(set(result)) != len(result):
         raise DocxWriteError('Evidence IDs cannot be duplicated.')
     return result
+
+
+def _is_workflow_note(value: str) -> bool:
+    return bool(workflow_note_fragments(value)) and not publication_text(value)
+
+
+def _publication_paragraphs(values) -> tuple[str, ...]:
+    cleaned = (publication_text(value) for value in values)
+    return tuple(value for value in cleaned if value)
 
 
 @dataclass(frozen=True)
@@ -198,6 +212,7 @@ class EquationDraft:
     description: str
     evidence_ids: tuple[str, ...] = ()
     pending_reviews: tuple[str, ...] = ()
+    subsection_index: int | None = None
 
     def __post_init__(self):
         if not isinstance(self.section_key, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', self.section_key):
@@ -209,6 +224,9 @@ class EquationDraft:
         if len(pending) > 32:
             raise DocxWriteError('Too many pending equation review markers.')
         object.__setattr__(self, 'pending_reviews', pending)
+        if (self.subsection_index is not None
+                and (type(self.subsection_index) is not int or not 1 <= self.subsection_index <= 32)):
+            raise DocxWriteError('Equation subsection index is invalid.')
 
 
 @dataclass(frozen=True)
@@ -233,12 +251,16 @@ class PaperDraft:
             raise DocxWriteError('Paper tables contain an invalid value.')
         if any(not isinstance(item, FigureDraft) for item in self.figures):
             raise DocxWriteError('Paper figures contain an invalid value.')
+        if len(self.equations) > MAX_PAPER_EQUATIONS:
+            raise DocxWriteError('Paper equations exceed the document limit.')
         if any(not isinstance(item, EquationDraft) for item in self.equations):
             raise DocxWriteError('Paper equations contain an invalid value.')
         mapped_figures = tuple(item for item in self.figures if item.visual_type == 'result')
-        keys = [item.section_key for item in (*self.sections, *self.tables, *mapped_figures)]
-        if len(set(keys)) != len(keys):
-            raise DocxWriteError('Each draft block requires a distinct mapping key.')
+        content_keys = [item.section_key for item in (*self.sections, *self.tables)]
+        figure_keys = [item.section_key for item in mapped_figures]
+        if (len(set(content_keys)) != len(content_keys)
+                or set(content_keys).intersection(figure_keys)):
+            raise DocxWriteError('Text, table, and figure mapping keys must not collide.')
         visual_ids = [item.visual_id for item in self.figures]
         if len(set(visual_ids)) != len(visual_ids):
             raise DocxWriteError('Each figure requires a distinct visual ID.')
@@ -253,6 +275,11 @@ class PaperDraft:
         section_keys = {item.section_key for item in self.sections}
         if any(item.section_key not in section_keys for item in self.equations):
             raise DocxWriteError('Equation must refer to a declared paper section.')
+        sections_by_key = {item.section_key: item for item in self.sections}
+        if any(item.subsection_index is not None
+               and item.subsection_index > len(sections_by_key[item.section_key].subsections)
+               for item in self.equations):
+            raise DocxWriteError('Equation subsection index is outside its parent section.')
 
 
 @dataclass(frozen=True)
@@ -299,7 +326,8 @@ def _append_generic_artifact_anchors(document, draft: PaperDraft) -> None:
         table.style = 'Table Grid'
         for column_index, cell in enumerate(table.rows[0].cells):
             cell.text = '{{table:' + table_draft.section_key + ':' + str(column_index) + '}}'
-    for figure_index, _figure in enumerate(result_figures, start=1):
+    figure_section_keys = tuple(dict.fromkeys(item.section_key for item in result_figures))
+    for figure_index, _section_key in enumerate(figure_section_keys, start=1):
         document.add_heading(_generic_figure_anchor_title(figure_index), level=3)
 
 
@@ -390,8 +418,7 @@ def _generic_document_bytes(draft: PaperDraft) -> bytes:
     artifacts_added = False
     for item in ordered_sections:
         if fallback_before == item.section_key and mapped_artifacts_present:
-            document.add_heading(_numbered_section_title('results') + '（待补正文）', level=1)
-            document.add_paragraph('结果正文待补充；请结合下方已验证数据补充分析。')
+            document.add_heading(_numbered_section_title('results'), level=1)
             _append_generic_artifact_anchors(document, draft)
             artifacts_added = True
         document.add_heading(_numbered_section_title(item.section_key), level=1)
@@ -402,8 +429,7 @@ def _generic_document_bytes(draft: PaperDraft) -> bytes:
             _append_generic_artifact_anchors(document, draft)
             artifacts_added = True
     if mapped_artifacts_present and not artifacts_added:
-        document.add_heading(_numbered_section_title('results') + '（待补正文）', level=1)
-        document.add_paragraph('结果正文待补充；请结合下方已验证数据补充分析。')
+        document.add_heading(_numbered_section_title('results'), level=1)
         _append_generic_artifact_anchors(document, draft)
 
     footer = section.footer.paragraphs[0]
@@ -477,8 +503,9 @@ def _generic_template_mapping(template_path: Path, draft: PaperDraft):
         for item in draft.sections:
             selections[item.section_key] = headings[_numbered_section_title(item.section_key)]
         result_figures = tuple(item for item in draft.figures if item.visual_type == 'result')
-        for index, item in enumerate(result_figures, start=1):
-            selections[item.section_key] = headings[_generic_figure_anchor_title(index)]
+        figure_section_keys = tuple(dict.fromkeys(item.section_key for item in result_figures))
+        for index, section_key in enumerate(figure_section_keys, start=1):
+            selections[section_key] = headings[_generic_figure_anchor_title(index)]
         for item in draft.tables:
             selections[item.section_key] = next(tables).anchor_id
     except (StopIteration, KeyError) as exc:
@@ -583,10 +610,52 @@ def _math_paragraph(expression: str):
     symbols = {
         '\\alpha': 'α', '\\beta': 'β', '\\gamma': 'γ', '\\delta': 'δ',
         '\\Delta': 'Δ', '\\theta': 'θ', '\\lambda': 'λ', '\\mu': 'μ',
-        '\\sigma': 'σ', '\\omega': 'ω', '\\pi': 'π', '\\sum': '∑',
+        '\\rho': 'ρ', '\\tau': 'τ', '\\epsilon': 'ε', '\\varepsilon': 'ε',
+        '\\sigma': 'σ', '\\omega': 'ω', '\\Omega': 'Ω', '\\pi': 'π', '\\sum': '∑',
+        '\\int': '∫', '\\partial': '∂', '\\exp': 'exp', '\\max': 'max',
+        '\\min': 'min', '\\inf': 'inf', '\\to': '→', '\\in': '∈',
+        '\\cup': '∪', '\\land': '∧', '\\lor': '∨',
         '\\prod': '∏', '\\cdot': '·', '\\times': '×', '\\leq': '≤',
-        '\\geq': '≥', '\\neq': '≠', '\\infty': '∞',
+        '\\le': '≤', '\\geq': '≥', '\\ge': '≥', '\\neq': '≠', '\\infty': '∞',
     }
+
+    def read_group(value, offset):
+        if offset >= len(value) or value[offset] != '{':
+            return None, offset
+        depth = 0
+        for end in range(offset, len(value)):
+            if value[end] == '{':
+                depth += 1
+            elif value[end] == '}':
+                depth -= 1
+                if depth == 0:
+                    return value[offset + 1:end], end + 1
+        return None, offset
+
+    def normalize_latex(value):
+        supported = True
+        value = re.sub(r'\\tag\s*\{[^{}]*\}', '', value)
+        value = value.replace(r'\left', '').replace(r'\right', '')
+        value = re.sub(r'\\(?:qquad|quad|;|,|!|:)\s*', ' ', value)
+
+        # Keep fractions editable while expressing them in a readable linear form.
+        while r'\frac' in value:
+            start = value.find(r'\frac')
+            numerator, after_numerator = read_group(value, start + len(r'\frac'))
+            denominator, end = read_group(value, after_numerator)
+            if numerator is None or denominator is None:
+                supported = False
+                break
+            value = value[:start] + f'({numerator})/({denominator})' + value[end:]
+
+        value = re.sub(r'\\mathcal\s*\{\s*R\s*\}', 'ℛ', value)
+        value = re.sub(r'\\mathbb\s*\{\s*Z\s*\}', 'ℤ', value)
+        value = value.replace(r'\{', '{').replace(r'\}', '}')
+        for command, symbol in sorted(symbols.items(), key=lambda item: -len(item[0])):
+            value = re.sub(re.escape(command) + r'(?![A-Za-z])', lambda _: symbol, value)
+        return value, supported
+
+    expression, normalized = normalize_latex(expression)
 
     def add_run(parent, value):
         run = ET.SubElement(parent, _M + 'r')
@@ -617,7 +686,7 @@ def _math_paragraph(expression: str):
     ET.SubElement(paragraph_properties, _W + 'jc', {_W + 'val': 'center'})
     math = ET.SubElement(paragraph, _M + 'oMath')
     index = 0
-    supported = True
+    supported = normalized
     while index < len(expression):
         if expression[index] == '\\':
             match = re.match(r'\\[A-Za-z]+', expression[index:])
@@ -692,25 +761,66 @@ def _section_placeholder(parent, heading, token, heading_nodes):
     return None
 
 
-def _markers(evidence_ids, pending_reviews=()):
-    result = []
-    if evidence_ids:
-        result.append('证据：' + ', '.join(evidence_ids))
-    else:
-        result.append('待人工核验：内容尚未关联证据')
-    result.extend('待人工核验：' + item for item in pending_reviews)
-    return result
+def paper_body_character_count(draft):
+    """Count authored body content, independent of any sample text in a template."""
+    text = [publication_text(draft.title), *(publication_text(item) for item in draft.keywords)]
+    for section in draft.sections:
+        text.append(_numbered_section_title(section.section_key))
+        text.extend(publication_text(item) for item in section.paragraphs)
+        for subsection in section.subsections:
+            text.append(publication_text(subsection.title))
+            text.extend(publication_text(item) for item in subsection.paragraphs)
+    for equation in draft.equations:
+        text.append(publication_text(equation.description))
+    for figure in draft.figures:
+        text.extend((publication_text(figure.caption), publication_text(figure.explanation)))
+    total = sum(len(item) for item in text)
+    if total > 1_000_000:
+        raise DocxWriteError('Paper body exceeds its audit character limit.')
+    return total
+
+
+def _paper_review_metadata(draft, formatting_reviews=(), problem_coverage=()):
+    blocks = [*draft.sections, *draft.equations, *draft.tables, *draft.figures]
+    blocks.extend(subsection for section in draft.sections for subsection in section.subsections)
+    evidence = tuple(eid for block in blocks for eid in block.evidence_ids)
+    reviews = tuple(note for block in blocks for note in (
+        (() if block.evidence_ids else ('内容尚未关联证据',)) + block.pending_reviews
+        + tuple(fragment for value in _audit_text_values(block)
+                for fragment in workflow_note_fragments(value))))
+    result_evidence = problem_coverage_evidence(draft.sections, tuple(problem_coverage))
+    scoped_evidence = tuple((item['problem_id'], tuple(item['evidence_ids'])) for item in result_evidence)
+    return PaperReviewMetadata(
+        evidence, reviews + tuple(formatting_reviews), draft.pending_references,
+        paper_body_character_count(draft), scoped_evidence,
+    )
+
+
+def _audit_text_values(block):
+    values = list(getattr(block, 'paragraphs', ()))
+    for name in ('title', 'caption', 'description', 'expression', 'explanation'):
+        value = getattr(block, name, None)
+        if isinstance(value, str):
+            values.append(value)
+    for name in ('headers',):
+        values.extend(getattr(block, name, ()))
+    for row in getattr(block, 'rows', ()):
+        values.extend(row)
+    return tuple(values)
 
 
 def _replace_table(table, draft: TableDraft):
     rows = table.findall(_W + 'tr')
     if not rows:
         raise DocxWriteError('Mapped table has no header row to preserve.')
+    headers = tuple(publication_text(item) for item in draft.headers)
+    if any(not item for item in headers):
+        raise DocxWriteError('Table header contains only internal workflow text and cannot be published.')
     grid = table.find(_W + 'tblGrid')
     column_count = len(grid.findall(_W + 'gridCol')) if grid is not None else len(rows[0].findall(_W + 'tc'))
-    if column_count != len(draft.headers) or len(rows[0].findall(_W + 'tc')) != column_count:
+    if column_count != len(headers) or len(rows[0].findall(_W + 'tc')) != column_count:
         raise DocxWriteError('Mapped table columns do not match the confirmed draft schema.')
-    _set_row(rows[0], draft.headers)
+    _set_row(rows[0], headers)
     data_template = deepcopy(rows[1] if len(rows) > 1 else rows[0])
     for row in rows[1:]:
         table.remove(row)
@@ -718,8 +828,11 @@ def _replace_table(table, draft: TableDraft):
     if header_flag is not None:
         data_template.find(_W + 'trPr').remove(header_flag)
     for values in draft.rows:
+        published_values = tuple(publication_text(value) for value in values)
+        if not any(published_values):
+            continue
         row = deepcopy(data_template)
-        _set_row(row, values)
+        _set_row(row, published_values)
         table.append(row)
 
 
@@ -745,9 +858,12 @@ def _drawing_paragraph(relationship_id: str, figure: FigureDraft, drawing_id: in
     ET.SubElement(inline, _WP + 'extent', {'cx': str(extent[0]), 'cy': str(extent[1])})
     evidence = ', '.join(figure.evidence_ids) or 'not linked'
     description = f'Visual type: {figure.visual_type}; Evidence: {evidence}'
-    if figure.explanation:
-        description += '; ' + figure.explanation
-    image_name = f'figure-{figure.visual_id}'
+    explanation = publication_text(figure.explanation)
+    if explanation:
+        description += '; ' + explanation
+    image_name = f'figure-{figure.section_key}'
+    if figure.visual_id != figure.section_key:
+        image_name += f'-{figure.visual_id}'
     ET.SubElement(inline, _WP + 'docPr', {'id': str(drawing_id), 'name': image_name,
                                           'descr': description})
     frame = ET.SubElement(inline, _WP + 'cNvGraphicFramePr')
@@ -807,7 +923,7 @@ def _binding_for(mapping, key, kind):
 
 
 def write_paper(template_path: Path, output_directory: Path, inspection: TemplateInspection,
-                mapping: TemplateMapping, draft: PaperDraft) -> DocxWriteResult:
+                mapping: TemplateMapping, draft: PaperDraft, *, problem_coverage=()) -> DocxWriteResult:
     """Write a new versioned DOCX. The source template is never opened for writing."""
     if not isinstance(inspection, TemplateInspection) or not isinstance(mapping, TemplateMapping):
         raise DocxWriteError('Template inspection and mapping are required.')
@@ -865,16 +981,21 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
     body_paragraphs = list(body.iter(_W + 'p'))
     title_token = '{{title}}'
     keywords_token = '{{keywords}}'
-    title_replaced = any(_replace_placeholder(item, title_token, draft.title) for item in body_paragraphs)
-    keywords_text = '关键词：' + ('；'.join(draft.keywords) if draft.keywords else '待补充')
+    published_title = publication_text(draft.title) or '数学建模论文'
+    published_keywords = tuple(value for item in draft.keywords
+                               if (value := publication_text(item)))
+    title_replaced = any(_replace_placeholder(item, title_token, published_title) for item in body_paragraphs)
+    keywords_text = '关键词：' + '；'.join(published_keywords) if published_keywords else ''
     keywords_replaced = any(_replace_placeholder(item, keywords_token, keywords_text)
                             for item in body_paragraphs)
     if not title_replaced:
-        body.insert(0, _styled_paragraph(draft.title, 'Title'))
-    if not keywords_replaced and not any(item.section_key == 'abstract' for item in draft.sections):
+        body.insert(0, _styled_paragraph(published_title, 'Title'))
+    if keywords_text and not keywords_replaced and not any(item.section_key == 'abstract' for item in draft.sections):
         body.insert(1 if not title_replaced else 0, _styled_paragraph(keywords_text, 'Caption'))
 
     section_tails = {}
+    subsection_tails = {}
+    formatting_reviews = []
     for section in draft.sections:
         binding = _binding_for(mapping, section.section_key, 'heading')
         heading = anchor_nodes[binding.anchor_id]
@@ -883,51 +1004,71 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
             raise DocxWriteError('Mapped heading has no writable parent.')
         token = '{{section:' + section.section_key + '}}'
         inserted = []
+        paragraphs_to_publish = _publication_paragraphs(section.paragraphs)
         placeholder = _section_placeholder(parent, heading, token, heading_nodes)
         if placeholder is not None:
-            _replace_placeholder(placeholder, token, section.paragraphs[0])
+            if paragraphs_to_publish:
+                _replace_placeholder(placeholder, token, paragraphs_to_publish[0])
+            else:
+                parent.remove(placeholder)
         if placeholder is not None:
-            inserted.append(placeholder)
-            inserted.extend(_paragraph(value) for value in section.paragraphs[1:])
-            _after(parent, placeholder, inserted[1:])
+            if paragraphs_to_publish:
+                inserted.append(placeholder)
+                inserted.extend(_paragraph(value) for value in paragraphs_to_publish[1:])
+                _after(parent, placeholder, inserted[1:])
         else:
-            inserted = [_paragraph(value) for value in section.paragraphs]
-            _after(parent, heading, inserted)
-        marker_paragraphs = [_paragraph(text) for text in _markers(section.evidence_ids, section.pending_reviews)]
-        _after(parent, inserted[-1], marker_paragraphs)
-        tail = marker_paragraphs[-1] if marker_paragraphs else inserted[-1]
-        if section.section_key == 'abstract' and not keywords_replaced:
+            inserted = [_paragraph(value) for value in paragraphs_to_publish]
+            if inserted:
+                _after(parent, heading, inserted)
+        tail = inserted[-1] if inserted else heading
+        if keywords_text and section.section_key == 'abstract' and not keywords_replaced:
             keyword_paragraph = _styled_paragraph(keywords_text, 'Caption')
             _after(parent, tail, [keyword_paragraph])
             tail = keyword_paragraph
         chapter_number = _section_decimal_number(section.section_key)
         for subsection_number, subsection in enumerate(section.subsections, start=1):
+            subsection_paragraphs = _publication_paragraphs(subsection.paragraphs)
+            subsection_title = publication_text(subsection.title)
+            if not subsection_paragraphs or not subsection_title:
+                continue
             subsection_heading = _styled_paragraph(
-                f'{chapter_number}.{subsection_number} {subsection.title}', 'Heading2')
-            subsection_body = [_paragraph(value) for value in subsection.paragraphs]
-            subsection_markers = [_paragraph(text) for text in _markers(
-                subsection.evidence_ids, subsection.pending_reviews)]
-            additions = [subsection_heading, *subsection_body, *subsection_markers]
+                f'{chapter_number}.{subsection_number} {subsection_title}', 'Heading2')
+            subsection_body = [_paragraph(value) for value in subsection_paragraphs]
+            additions = [subsection_heading, *subsection_body]
             _after(parent, tail, additions)
             tail = additions[-1]
+            subsection_tails[(section.section_key, subsection_number)] = tail
         section_tails[section.section_key] = tail
         parent_map = _all_parents(document)
 
-    for equation_number, equation in enumerate(draft.equations, start=1):
+    published_equations = tuple(
+        (equation, publication_text(equation.expression), publication_text(equation.description))
+        for equation in draft.equations
+    )
+    published_equations = tuple(item for item in published_equations if all(item[1:]))
+    for equation_number, (equation, expression, description) in enumerate(published_equations, start=1):
         binding = _binding_for(mapping, equation.section_key, 'heading')
         heading = anchor_nodes[binding.anchor_id]
         parent = _all_parents(document).get(heading)
         if parent is None:
             raise DocxWriteError('Mapped equation section has no writable parent.')
-        tail = section_tails.get(equation.section_key, heading)
-        caption = _styled_paragraph(f'公式（{equation_number}）：{equation.description}', 'Caption')
-        equation_paragraph, syntax_supported = _math_paragraph(equation.expression)
+        anchor_key = (equation.section_key, equation.subsection_index)
+        if equation.subsection_index is None:
+            tail = section_tails.get(equation.section_key, heading)
+        else:
+            if anchor_key not in subsection_tails:
+                raise DocxWriteError('Mapped equation subsection does not exist.')
+            tail = subsection_tails[anchor_key]
+        caption = _styled_paragraph(f'公式（{equation_number}）：{description}', 'Caption')
+        equation_paragraph, syntax_supported = _math_paragraph(expression)
         extras = [equation_paragraph, caption]
         if not syntax_supported:
-            extras.append(_paragraph('待人工核验：公式保留为可编辑线性数学文本，部分语法未转换为二维数学结构。'))
-        extras.extend(_paragraph(text) for text in _markers(equation.evidence_ids, equation.pending_reviews))
+            formatting_reviews.append('公式保留为可编辑线性数学文本，部分语法未转换为二维数学结构。')
         _after(parent, tail, extras)
-        section_tails[equation.section_key] = extras[-1]
+        if equation.subsection_index is None:
+            section_tails[equation.section_key] = extras[-1]
+        else:
+            subsection_tails[anchor_key] = extras[-1]
 
     for table_number, table_draft in enumerate(draft.tables, start=1):
         binding = _binding_for(mapping, table_draft.section_key, 'table')
@@ -936,7 +1077,7 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
         parent = parent_map.get(table)
         if parent is None:
             raise DocxWriteError('Mapped table has no writable parent.')
-        caption_text = table_draft.caption or _generic_section_title(table_draft.section_key)
+        caption_text = publication_text(table_draft.caption) or _generic_section_title(table_draft.section_key)
         caption_value = f'表{table_number}：{caption_text}'
         caption_token = '{{table_caption:' + table_draft.section_key + '}}'
         caption_replaced = any(_replace_placeholder(item, caption_token, caption_value)
@@ -945,8 +1086,6 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
             parent.insert(list(parent).index(table), _styled_paragraph(caption_value, 'Caption'))
             parent_map = _all_parents(document)
             parent = parent_map.get(table)
-        markers = [_paragraph(text) for text in _markers(table_draft.evidence_ids, table_draft.pending_reviews)]
-        _after(parent, table, markers)
         parent_map = _all_parents(document)
 
     existing_ids = {item.get('Id') for item in relationships.findall(_PKG_REL + 'Relationship')}
@@ -987,23 +1126,34 @@ def write_paper(template_path: Path, output_directory: Path, inspection: Templat
         parts[media_name] = figure.image_bytes
         figure_paragraph = _drawing_paragraph(relationship_id, figure, drawing_id)
         drawing_id += 1
-        extras = [figure_paragraph, _styled_paragraph(f'图{figure_number}：{figure.caption}', 'Caption')]
-        if figure.explanation:
-            extras.append(_paragraph(figure.explanation))
-        extras.extend(_paragraph(text) for text in _markers(figure.evidence_ids, figure.pending_reviews))
+        figure_caption = publication_text(figure.caption) or _generic_section_title(figure.section_key)
+        figure_explanation = publication_text(figure.explanation)
+        extras = [figure_paragraph, _styled_paragraph(f'图{figure_number}：{figure_caption}', 'Caption')]
+        if figure_explanation:
+            extras.append(_paragraph(figure_explanation))
         tail = section_tails.get(figure.section_key, heading)
         _after(parent, tail, extras)
         section_tails[figure.section_key] = extras[-1]
 
-    if not any(item.section_key == 'references' for item in draft.sections):
-        for pending in draft.pending_references:
-            body.insert(max(0, len(list(body)) - (1 if body.find(_W + 'sectPr') is not None else 0)),
-                        _paragraph('待补文献：' + pending))
+    parts[REVIEW_PART] = encode_review_metadata(
+        _paper_review_metadata(draft, formatting_reviews, problem_coverage))
+    for relationship in list(relationships):
+        if relationship.get('Type') == REVIEW_RELATIONSHIP and relationship.get('Target') == REVIEW_TARGET:
+            relationships.remove(relationship)
+    relationship_number += 1
+    audit_id = f'rIdMMPSReview{relationship_number:04d}'
+    while audit_id in existing_ids:
+        relationship_number += 1
+        audit_id = f'rIdMMPSReview{relationship_number:04d}'
+    ET.SubElement(relationships, _PKG_REL + 'Relationship', {
+        'Id': audit_id, 'Type': REVIEW_RELATIONSHIP, 'Target': REVIEW_TARGET,
+    })
+    _add_content_type(content_types, 'xml', 'application/xml')
 
     parts['word/document.xml'] = _serialize(document, document_original)
     parts['word/_rels/document.xml.rels'] = _serialize(relationships, rels_original)
     parts['[Content_Types].xml'] = _serialize(content_types, types_original)
-    modified = ('[Content_Types].xml', 'word/_rels/document.xml.rels', 'word/document.xml')
+    modified = ('[Content_Types].xml', 'word/_rels/document.xml.rels', 'word/document.xml', REVIEW_PART)
     output_bytes = BytesIO()
     try:
         with ZipFile(BytesIO(source_bytes)) as source, ZipFile(output_bytes, 'w', ZIP_DEFLATED) as output:

@@ -26,15 +26,23 @@ class FakeTransport:
         self.prompts = []
         self.selections = []
         self.progress_text = None
+        self.progress_chunks = None
+        self.output_schemas = []
 
     def verify_policy(self, cancel_event=None):
         return self.observation
 
-    def generate(self, prompt, cancel_event=None, *, model=None, effort=None, on_agent_text=None):
+    def generate(self, prompt, cancel_event=None, *, model=None, effort=None, on_agent_text=None,
+                 output_schema=None):
         self.prompts.append(prompt)
         self.selections.append((model, effort))
-        if callable(on_agent_text) and self.progress_text is not None:
-            on_agent_text('message-1', self.progress_text)
+        self.output_schemas.append(output_schema)
+        if callable(on_agent_text):
+            if self.progress_chunks is not None:
+                for chunk in self.progress_chunks:
+                    on_agent_text('message-1', chunk)
+            elif self.progress_text is not None:
+                on_agent_text('message-1', self.progress_text)
         return CodexGenerationResult('{"ok":true}', self.observation)
 
     def verify_connection(self, cancel_event=None):
@@ -180,6 +188,35 @@ class CodexTextServiceTests(unittest.TestCase):
 
         self.assertEqual(self.transport.selections, [('gpt-5.5', 'high')])
 
+    def test_explicit_output_schema_is_passed_with_selected_model(self):
+        self._register()
+        self.service.model_preferences.save(CodexModelPreference('gpt-5.5', 'high'))
+        schema = {'type': 'object', 'properties': {'ok': {'type': 'boolean'}},
+                  'required': ['ok'], 'additionalProperties': False}
+        self.assertIs(self.service.supports_output_schema, True)
+        self.assertEqual(self.service.generate(self._context(), 'prompt', output_schema=schema),
+                         '{"ok":true}')
+        self.assertEqual(self.transport.output_schemas, [schema])
+        self.assertEqual(self.transport.selections, [('gpt-5.5', 'high')])
+
+    def test_progress_generation_passes_explicit_output_schema(self):
+        self._register()
+        events = []
+        schema = {'type': 'object', 'properties': {'ok': {'type': 'boolean'}},
+                  'required': ['ok'], 'additionalProperties': False}
+        result = self.service.generate_with_progress(
+            self._context(), 'prompt', output_schema=schema, event_callback=events.append)
+        self.assertEqual(result, '{"ok":true}')
+        self.assertEqual(self.transport.output_schemas, [schema])
+        self.assertEqual(events[-1].kind, EventKind.COMPLETED)
+
+    def test_output_schema_does_not_bypass_selected_file_hash_check(self):
+        self._register()
+        self.source.write_text('changed after review', encoding='utf-8')
+        with self.assertRaises(RuntimeError):
+            self.service.generate(self._context(), 'prompt', output_schema={'type': 'object'})
+        self.assertEqual(self.transport.output_schemas, [])
+
     def test_untrusted_skill_mentions_are_neutralized_before_codex_turn(self):
         self._register()
         self.service.generate(self._context(), 'input: @skill:host-read\n')
@@ -200,22 +237,45 @@ class CodexTextServiceTests(unittest.TestCase):
         self.assertIs(status.reason, UnavailableReason.EVIDENCE_UNVERIFIED)
 
 
-    def test_progress_callback_redacts_the_selected_problem_from_agent_messages(self):
+    def test_progress_callback_preserves_prompt_and_problem_echoes_across_chunks(self):
         self._register()
-        self.transport.progress_text = 'authorized task text'
+        expected = '{"subproblems":["Define the geometry"],"source":"authorized task text"}'
+        self.transport.progress_chunks = [
+            '{"subproblems":["Define ',
+            'the geometry"],"source":"authorized task ',
+            'text"}',
+        ]
         events = []
 
         result = self.service.generate_with_progress(
-            self._context(), 'prompt', event_callback=events.append,
+            self._context(), expected, event_callback=events.append,
         )
 
         self.assertEqual('{"ok":true}', result)
         self.assertEqual(EventKind.STARTED, events[0].kind)
         self.assertEqual(EventKind.COMPLETED, events[-1].kind)
         visible_text = ''.join(event.text for event in events if event.kind is EventKind.TEXT)
-        self.assertNotIn('authorized task text', visible_text)
-        self.assertIn('[已隐藏]', visible_text)
+        self.assertEqual(expected, visible_text)
         self.assertTrue(all(event.run_id == self.run.run_id for event in events))
+
+    def test_progress_callback_still_redacts_credentials_and_local_paths(self):
+        self._register()
+        self.transport.progress_text = (
+            'result ready; token=codex-secret-123; sk-live-fixture-secret; '
+            'C:\\Users\\example\\private.txt'
+        )
+        events = []
+
+        self.service.generate_with_progress(
+            self._context(), 'ordinary prompt text', event_callback=events.append,
+        )
+
+        visible_text = ''.join(event.text for event in events if event.kind is EventKind.TEXT)
+        self.assertIn('result ready;', visible_text)
+        self.assertNotIn('codex-secret-123', visible_text)
+        self.assertNotIn('sk-live-fixture-secret', visible_text)
+        self.assertNotIn('C:\\Users\\example\\private.txt', visible_text)
+        self.assertGreaterEqual(visible_text.count('[已隐藏]'), 3)
 
     def test_progress_callback_reports_blocked_host_actions_without_tool_text(self):
         self._register()

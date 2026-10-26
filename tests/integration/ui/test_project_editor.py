@@ -19,7 +19,7 @@ from mathmodel_paper_studio.storage.repositories import ProjectRepository, RunRe
 from mathmodel_paper_studio.ui.main_window import MainWindow
 from mathmodel_paper_studio.ui.project_editor import ProjectEditorDialog
 
-ROOT = Path(r'F:\Codex另一个工作的地方\tmp\mathmodel-paper-studio-project-edit-20261018\project-editor')
+ROOT = Path(r'F:\MathModelPaperStudio\tmp\mathmodel-paper-studio-project-edit-20261018\project-editor')
 APP = None
 
 
